@@ -1,0 +1,920 @@
+
+LOCKEDIN — BUNDLE 08
+Real‑time Messaging (DMs) + Notifications (foundational)
+================================================================================
+
+OVERVIEW
+--------------------------------------------------------------------------------
+This bundle adds:
+1) Private 1:1 and small-group messaging with WebSockets.
+2) Youth‑safe content filter (blocks contact exchange & meetup solicitations for minors).
+3) In-app notifications (new message, mentions, post interactions — infra & examples).
+4) Frontend messaging UI (threads list, chat view, composer with typing indicators).
+5) Notification bell + drawer and unread counters.
+
+It is designed to plug into the v1 codebase you’ve been assembling (NestJS + Prisma + React + shadcn/ui + Tailwind).
+
+No secrets or personal info are embedded. All env-sensitive values are read via environment variables or fallbacks.
+
+
+--------------------------------------------------------------------------------
+BACKEND — PRISMA SCHEMA PATCH (add to prisma/schema.prisma)
+--------------------------------------------------------------------------------
+model User {
+  id                String          @id @default(cuid())
+  email             String          @unique
+  fullName          String?
+  // ... existing fields
+  ageMode           AgeMode         @default(ADULT) // 'ADULT' | 'YOUTH'
+  // relations
+  threads           ChatThreadMember[]
+  messages          Message[]
+  notifications     Notification[]
+}
+
+enum AgeMode {
+  ADULT
+  YOUTH
+}
+
+model ChatThread {
+  id                String               @id @default(cuid())
+  isGroup           Boolean              @default(false)
+  title             String?
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+  lastMessageAt     DateTime?
+  // relations
+  members           ChatThreadMember[]
+  messages          Message[]
+  // indexing for listing & unread counts
+  @@index([lastMessageAt, updatedAt])
+}
+
+model ChatThreadMember {
+  id           String     @id @default(cuid())
+  userId       String
+  threadId     String
+  joinedAt     DateTime   @default(now())
+  // read/notifications
+  lastReadAt   DateTime?
+
+  // relations
+  user         User       @relation(fields: [userId], references: [id])
+  thread       ChatThread @relation(fields: [threadId], references: [id])
+
+  @@unique([userId, threadId])
+  @@index([threadId])
+  @@index([userId, lastReadAt])
+}
+
+model Message {
+  id            String     @id @default(cuid())
+  threadId      String
+  authorId      String
+  body          String
+  safeBody      String      // sanitized/filtered version (youth mode or general safety)
+  createdAt     DateTime    @default(now())
+  editedAt      DateTime?
+  deletedAt     DateTime?
+  // delivery state
+  deliveredAt   DateTime?
+  // relations
+  author        User        @relation(fields: [authorId], references: [id])
+  thread        ChatThread  @relation(fields: [threadId], references: [id])
+  flags         MessageFlag[]
+
+  @@index([threadId, createdAt])
+  @@index([authorId, createdAt])
+}
+
+model MessageFlag {
+  id            String     @id @default(cuid())
+  messageId     String
+  reason        String
+  severity      Int        @default(1) // 1=low 5=high
+  createdAt     DateTime   @default(now())
+
+  message       Message    @relation(fields: [messageId], references: [id])
+  @@index([messageId, createdAt])
+}
+
+model Notification {
+  id            String     @id @default(cuid())
+  userId        String
+  type          NotificationType
+  title         String?
+  body          String?
+  data          Json?
+  createdAt     DateTime @default(now())
+  readAt        DateTime?
+
+  user          User     @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([userId, readAt])
+}
+
+enum NotificationType {
+  NEW_MESSAGE
+  THREAD_ADDED
+  MENTION
+  POST_COMMENT
+  POST_REACTION
+  SYSTEM
+}
+
+
+--------------------------------------------------------------------------------
+BACKEND — NESTJS MODULE (apps/api/src/modules/messaging/*)
+--------------------------------------------------------------------------------
+
+// apps/api/src/modules/messaging/messaging.module.ts
+import { Module } from '@nestjs/common';
+import { PrismaService } from '@/shared/prisma.service';
+import { MessagingService } from './messaging.service';
+import { ThreadsController } from './threads.controller';
+import { MessagesController } from './messages.controller';
+import { MessagingGateway } from './messaging.gateway';
+import { NotificationsService } from '../notifications/notifications.service';
+import { YouthSafetyService } from './youth-safety.service';
+
+@Module({
+  controllers: [ThreadsController, MessagesController],
+  providers: [
+    PrismaService,
+    MessagingService,
+    MessagingGateway,
+    YouthSafetyService,
+    NotificationsService,
+  ],
+  exports: [MessagingService],
+})
+export class MessagingModule {}
+
+
+// apps/api/src/modules/messaging/messaging.service.ts
+import { Injectable, BadRequestException, ForbiddenException } from '@nestjs/common';
+import { PrismaService } from '@/shared/prisma.service';
+import { YouthSafetyService } from './youth-safety.service';
+
+@Injectable()
+export class MessagingService {
+  constructor(
+    private prisma: PrismaService,
+    private safety: YouthSafetyService,
+  ) {}
+
+  async ensureThreadForMembers(memberIds: string[], title?: string) {
+    if (!memberIds || memberIds.length < 2) {
+      throw new BadRequestException('A thread must have at least two members.');
+    }
+    // For now create a new thread each time; you may deduplicate for 1:1
+    const thread = await this.prisma.chatThread.create({
+      data: {
+        isGroup: memberIds.length > 2,
+        title: title || null,
+        members: {
+          create: memberIds.map(userId => ({ userId })),
+        },
+      },
+      include: { members: true },
+    });
+    return thread;
+  }
+
+  async listMyThreads(userId: string) {
+    return this.prisma.chatThread.findMany({
+      where: { members: { some: { userId } } },
+      orderBy: { lastMessageAt: 'desc' },
+      include: {
+        members: { include: { user: true } },
+        messages: { orderBy: { createdAt: 'desc' }, take: 1, include: { author: true } },
+      },
+    });
+  }
+
+  async getThread(userId: string, threadId: string) {
+    const member = await this.prisma.chatThreadMember.findFirst({
+      where: { userId, threadId },
+    });
+    if (!member) throw new ForbiddenException('Not a member of this thread.');
+    return this.prisma.chatThread.findUnique({
+      where: { id: threadId },
+      include: {
+        members: { include: { user: true } },
+      },
+    });
+  }
+
+  async listMessages(userId: string, threadId: string, cursor?: string, take = 30) {
+    const member = await this.prisma.chatThreadMember.findFirst({
+      where: { userId, threadId },
+    });
+    if (!member) throw new ForbiddenException('Not a member of this thread.');
+
+    return this.prisma.message.findMany({
+      where: { threadId },
+      orderBy: { createdAt: 'desc' },
+      take,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      include: { author: true, flags: true },
+    });
+  }
+
+  async sendMessage(opts: {
+    authorId: string;
+    threadId: string;
+    body: string;
+  }) {
+    const { authorId, threadId } = opts;
+
+    const member = await this.prisma.chatThreadMember.findFirst({
+      where: { userId: authorId, threadId },
+      include: { user: true, thread: { include: { members: { include: { user: true } } } } },
+    });
+    if (!member) throw new ForbiddenException('Not a member of this thread.');
+
+    const { safeBody, flags } = this.safety.filterMessage({
+      authorAgeMode: member.user.ageMode,
+      body: opts.body || '',
+    });
+
+    const message = await this.prisma.message.create({
+      data: {
+        body: opts.body || '',
+        safeBody,
+        authorId,
+        threadId,
+      },
+      include: { author: true },
+    });
+
+    await this.prisma.chatThread.update({
+      where: { id: threadId },
+      data: { lastMessageAt: new Date() },
+    });
+
+    // Persist flags (if any)
+    if (flags.length) {
+      await this.prisma.$transaction(
+        flags.map(f => this.prisma.messageFlag.create({
+          data: {
+            messageId: message.id,
+            reason: f.reason,
+            severity: f.severity,
+          },
+        }))
+      );
+    }
+
+    return message;
+  }
+
+  async markRead(userId: string, threadId: string) {
+    const member = await this.prisma.chatThreadMember.findFirst({
+      where: { userId, threadId },
+    });
+    if (!member) throw new ForbiddenException('Not a member of this thread.');
+    return this.prisma.chatThreadMember.update({
+      where: { id: member.id },
+      data: { lastReadAt: new Date() },
+    });
+  }
+}
+
+
+// apps/api/src/modules/messaging/threads.controller.ts
+import { Controller, Get, Post, Body, Param, Query } from '@nestjs/common';
+import { MessagingService } from './messaging.service';
+import { CurrentUser } from '@/shared/current-user.decorator';
+
+@Controller('threads')
+export class ThreadsController {
+  constructor(private messaging: MessagingService) {}
+
+  @Get()
+  listMyThreads(@CurrentUser('id') userId: string) {
+    return this.messaging.listMyThreads(userId);
+  }
+
+  @Post()
+  createThread(
+    @CurrentUser('id') userId: string,
+    @Body() body: { memberIds: string[]; title?: string }
+  ) {
+    const members = Array.from(new Set([userId, ...(body.memberIds || [])]));
+    return this.messaging.ensureThreadForMembers(members, body.title);
+  }
+
+  @Get(':threadId')
+  getThread(@CurrentUser('id') userId: string, @Param('threadId') threadId: string) {
+    return this.messaging.getThread(userId, threadId);
+  }
+}
+
+
+// apps/api/src/modules/messaging/messages.controller.ts
+import { Controller, Get, Post, Body, Param, Query } from '@nestjs/common';
+import { MessagingService } from './messaging.service';
+import { CurrentUser } from '@/shared/current-user.decorator';
+import { NotificationsService } from '../notifications/notifications.service';
+import { MessagingGateway } from './messaging.gateway';
+
+@Controller('threads/:threadId/messages')
+export class MessagesController {
+  constructor(
+    private messaging: MessagingService,
+    private notifications: NotificationsService,
+    private gateway: MessagingGateway,
+  ) {}
+
+  @Get()
+  list(
+    @CurrentUser('id') userId: string,
+    @Param('threadId') threadId: string,
+    @Query('cursor') cursor?: string,
+    @Query('take') take?: string,
+  ) {
+    return this.messaging.listMessages(userId, threadId, cursor, Number(take) || 30);
+  }
+
+  @Post()
+  async send(
+    @CurrentUser('id') userId: string,
+    @Param('threadId') threadId: string,
+    @Body() body: { text: string },
+  ) {
+    const msg = await this.messaging.sendMessage({
+      authorId: userId,
+      threadId,
+      body: body?.text || '',
+    });
+
+    // Emit via WS and create notifications for all other members
+    await this.gateway.emitMessage(msg.threadId, {
+      ...msg,
+      // the frontend will prefer safeBody for YOUTH authors/viewers
+    });
+
+    // Create notifications for other members
+    // (service internally figures out recipients by thread membership)
+    await this.notifications.notifyNewMessage({ threadId, authorId: userId, messageId: msg.id });
+
+    return msg;
+  }
+}
+
+
+// apps/api/src/modules/messaging/messaging.gateway.ts
+import {
+  ConnectedSocket, MessageBody, OnGatewayConnection, OnGatewayDisconnect, SubscribeMessage, WebSocketGateway, WebSocketServer
+} from '@nestjs/websockets';
+import { Server, Socket } from 'socket.io';
+import { PrismaService } from '@/shared/prisma.service';
+
+@WebSocketGateway({
+  cors: { origin: '*' },
+  path: '/ws',
+  namespace: '/messaging',
+})
+export class MessagingGateway implements OnGatewayConnection, OnGatewayDisconnect {
+  @WebSocketServer() server: Server;
+  private userIdBySocket = new Map<string, string>();
+
+  constructor(private prisma: PrismaService) {}
+
+  async handleConnection(client: Socket) {
+    const userId = (client.handshake.auth && client.handshake.auth.userId) || client.handshake.query.userId;
+    if (!userId || typeof userId !== 'string') {
+      client.disconnect(true);
+      return;
+    }
+    this.userIdBySocket.set(client.id, userId);
+
+    // Auto-join rooms per member’s threads for targeted emits
+    const threads = await this.prisma.chatThreadMember.findMany({ where: { userId }, select: { threadId: true } });
+    threads.forEach(t => client.join(`thread:${t.threadId}`));
+  }
+
+  handleDisconnect(client: Socket) {
+    this.userIdBySocket.delete(client.id);
+  }
+
+  @SubscribeMessage('typing')
+  async onTyping(@ConnectedSocket() client: Socket, @MessageBody() payload: { threadId: string }) {
+    const userId = this.userIdBySocket.get(client.id);
+    if (!userId) return;
+    client.to(`thread:${payload.threadId}`).emit('typing', { threadId: payload.threadId, userId, at: Date.now() });
+  }
+
+  async emitMessage(threadId: string, message: any) {
+    this.server.to(`thread:${threadId}`).emit('message', message);
+  }
+}
+
+
+// apps/api/src/modules/messaging/youth-safety.service.ts
+import { Injectable } from '@nestjs/common';
+
+type FilterResult = {
+  safeBody: string;
+  flags: { reason: string; severity: number }[];
+};
+
+@Injectable()
+export class YouthSafetyService {
+  // VERY simple heuristic content filter for MVP. Replace with a policy engine later.
+  private contactRegex = new RegExp([
+    // emails
+    '\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b',
+    // phone numbers (loose)
+    '(?:(?:\\+?\\d{1,3}[\\s-]?)?(?:\\(?\\d{2,4}\\)?[\\s-]?)?\\d{3}[\\s-]?\\d{4})',
+    // socials / invite keywords
+    '\\b(discord|snap(chat)?|whats(app)?|telegram|insta(gram)?|tiktok|imessage)\\b',
+    // address hints
+    '\\b\\d{1,5}\\s+([A-Za-z0-9.,\\-\\s]+)\\b(?:street|st\\.?|avenue|ave\\.?|road|rd\\.?|boulevard|blvd\\.?|way|lane|ln\\.?|drive|dr\\.?)\\b',
+    // meet-up phrasing
+    '\\b(meet\\s?up|meet\\s?in\\s?person|hang\\s?out\\s?irl|come\\s?over|pick\\s?you\\s?up)\\b',
+  ].join('|'), 'i');
+
+  filterMessage(input: { authorAgeMode: 'ADULT' | 'YOUTH'; body: string }): FilterResult {
+    const body = input.body || '';
+    const flags: FilterResult['flags'] = [];
+
+    // If youth authored, scrub potentially unsafe contact exchange from the outbound text
+    let safeBody = body;
+    const risky = this.contactRegex.test(body);
+    if (risky) {
+      flags.push({ reason: 'Potential contact exchange / meet-up content', severity: input.authorAgeMode === 'YOUTH' ? 4 : 2 });
+      if (input.authorAgeMode === 'YOUTH') {
+        // mask risky segments
+        safeBody = body.replace(this.contactRegex, '[redacted for safety]');
+      }
+    }
+
+    // Basic profanity list placeholder (expand as needed)
+    const profanity = /\b(fuck|shit|bitch|asshole)\b/i;
+    if (profanity.test(body)) {
+      flags.push({ reason: 'Profanity', severity: 1 });
+    }
+
+    return { safeBody, flags };
+  }
+}
+
+
+--------------------------------------------------------------------------------
+BACKEND — NOTIFICATIONS MODULE (apps/api/src/modules/notifications/*)
+--------------------------------------------------------------------------------
+
+// apps/api/src/modules/notifications/notifications.module.ts
+import { Module } from '@nestjs/common';
+import { PrismaService } from '@/shared/prisma.service';
+import { NotificationsService } from './notifications.service';
+import { NotificationsController } from './notifications.controller';
+
+@Module({
+  controllers: [NotificationsController],
+  providers: [PrismaService, NotificationsService],
+  exports: [NotificationsService],
+})
+export class NotificationsModule {}
+
+
+// apps/api/src/modules/notifications/notifications.service.ts
+import { Injectable } from '@nestjs/common';
+import { PrismaService } from '@/shared/prisma.service';
+
+@Injectable()
+export class NotificationsService {
+  constructor(private prisma: PrismaService) {}
+
+  async notifyNewMessage(opts: { threadId: string; authorId: string; messageId: string }) {
+    // find thread members except author
+    const members = await this.prisma.chatThreadMember.findMany({
+      where: { threadId: opts.threadId, NOT: { userId: opts.authorId } },
+      select: { userId: true },
+    });
+
+    if (!members.length) return;
+
+    await this.prisma.$transaction(members.map((m) => this.prisma.notification.create({
+      data: {
+        userId: m.userId,
+        type: 'NEW_MESSAGE',
+        title: 'New message',
+        body: 'You have a new message',
+        data: { threadId: opts.threadId, messageId: opts.messageId },
+      },
+    })));
+  }
+
+  list(userId: string) {
+    return this.prisma.notification.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
+  }
+
+  async markAllRead(userId: string) {
+    await this.prisma.notification.updateMany({
+      where: { userId, readAt: null },
+      data: { readAt: new Date() },
+    });
+    return { ok: true };
+  }
+}
+
+
+// apps/api/src/modules/notifications/notifications.controller.ts
+import { Controller, Get, Post } from '@nestjs/common';
+import { NotificationsService } from './notifications.service';
+import { CurrentUser } from '@/shared/current-user.decorator';
+
+@Controller('notifications')
+export class NotificationsController {
+  constructor(private notifications: NotificationsService) {}
+
+  @Get()
+  list(@CurrentUser('id') userId: string) {
+    return this.notifications.list(userId);
+  }
+
+  @Post('read-all')
+  markAllRead(@CurrentUser('id') userId: string) {
+    return this.notifications.markAllRead(userId);
+  }
+}
+
+
+--------------------------------------------------------------------------------
+FRONTEND — API CLIENTS (apps/web/src/lib/api/messaging.ts)
+--------------------------------------------------------------------------------
+/* apps/web/src/lib/api/messaging.ts */
+import { api } from './transport';
+
+export const MessagingAPI = {
+  listThreads: () => api.get('/threads').then(r => r.data),
+  createThread: (memberIds: string[], title?: string) => api.post('/threads', { memberIds, title }).then(r => r.data),
+  getThread: (threadId: string) => api.get(`/threads/${threadId}`).then(r => r.data),
+  listMessages: (threadId: string, params?: { cursor?: string; take?: number }) =>
+    api.get(`/threads/${threadId}/messages`, { params }).then(r => r.data),
+  sendMessage: (threadId: string, text: string) => api.post(`/threads/${threadId}/messages`, { text }).then(r => r.data),
+};
+
+
+--------------------------------------------------------------------------------
+FRONTEND — API CLIENTS (apps/web/src/lib/api/notifications.ts)
+--------------------------------------------------------------------------------
+/* apps/web/src/lib/api/notifications.ts */
+import { api } from './transport';
+
+export const NotificationsAPI = {
+  list: () => api.get('/notifications').then(r => r.data),
+  markAllRead: () => api.post('/notifications/read-all').then(r => r.data),
+};
+
+
+--------------------------------------------------------------------------------
+FRONTEND — SOCKET CLIENT (apps/web/src/lib/ws/messaging.ts)
+--------------------------------------------------------------------------------
+/* apps/web/src/lib/ws/messaging.ts */
+import { io, Socket } from 'socket.io-client';
+
+let socket: Socket | null = null;
+
+export const connectMessagingSocket = (userId: string) => {
+  if (socket) return socket;
+  socket = io(`${import.meta.env.VITE_WS_URL || window.location.origin}`, {
+    path: '/ws',
+    auth: { userId },
+    transports: ['websocket'],
+    forceNew: true,
+    reconnection: true,
+    reconnectionAttempts: 10,
+    reconnectionDelay: 500,
+    autoConnect: true,
+    timeout: 10000,
+    extraHeaders: {},
+    query: { userId },
+  });
+  return socket;
+};
+
+export const getMessagingSocket = () => socket;
+
+
+--------------------------------------------------------------------------------
+FRONTEND — PAGES & COMPONENTS (apps/web/src/pages/Messages/index.tsx)
+--------------------------------------------------------------------------------
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { MessagingAPI } from '@/lib/api/messaging';
+import { connectMessagingSocket, getMessagingSocket } from '@/lib/ws/messaging';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Badge } from '@/components/ui/badge';
+import { motion } from 'framer-motion';
+import { User as UserIcon, Send, MessageSquare, Users, Loader2 } from 'lucide-react';
+import { User } from '@/entities/all';
+
+type Thread = any;
+type Message = any;
+
+export default function MessagesPage() {
+  const [user, setUser] = useState<any>(null);
+  const [threads, setThreads] = useState<Thread[]>([]);
+  const [activeThread, setActiveThread] = useState<Thread | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [sending, setSending] = useState(false);
+  const [composer, setComposer] = useState('');
+  const [typingUserIds, setTypingUserIds] = useState<string[]>([]);
+
+  useEffect(() => {
+    (async () => {
+      const me = await User.me();
+      setUser(me);
+      const th = await MessagingAPI.listThreads();
+      setThreads(th);
+      setActiveThread(th[0] || null);
+      connectMessagingSocket(me.id);
+      const s = getMessagingSocket();
+      if (!s) return;
+      s.on('message', (msg: any) => {
+        setMessages(prev => prev && prev[0]?.threadId === msg.threadId ? [...prev, msg] : prev);
+      });
+      s.on('typing', (evt: any) => {
+        setTypingUserIds(prev => {
+          if (evt.threadId !== activeThread?.id || evt.userId === me.id) return prev;
+          const next = Array.from(new Set([...prev, evt.userId]));
+          setTimeout(() => {
+            // auto-clear after 2s
+            setTypingUserIds(cur => cur.filter(id => id !== evt.userId));
+          }, 2000);
+          return next;
+        });
+      });
+      setLoading(false);
+    })();
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      if (!activeThread) return;
+      const msgs = await MessagingAPI.listMessages(activeThread.id, { take: 50 });
+      setMessages(msgs.reverse()); // chronological
+    })();
+  }, [activeThread?.id]);
+
+  const sendTyping = () => {
+    const s = getMessagingSocket();
+    if (!s || !activeThread) return;
+    s.emit('typing', { threadId: activeThread.id });
+  };
+
+  const sendMessage = async () => {
+    if (!activeThread || !composer.trim()) return;
+    setSending(true);
+    try {
+      const msg = await MessagingAPI.sendMessage(activeThread.id, composer.trim());
+      setMessages(prev => [...prev, msg]);
+      setComposer('');
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 via-white to-blue-50 p-4 md:p-6">
+      <div className="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-6">
+        {/* Threads list */}
+        <Card className="bg-white/90 border-gray-200/60 shadow">
+          <CardContent className="p-0">
+            <div className="p-4 border-b border-gray-100 flex items-center gap-2">
+              <MessageSquare className="w-5 h-5 text-indigo-600" />
+              <h2 className="font-semibold text-gray-800">Messages</h2>
+            </div>
+            <div className="divide-y">
+              {threads.map((t) => (
+                <button
+                  key={t.id}
+                  onClick={() => setActiveThread(t)}
+                  className={`w-full text-left px-4 py-3 hover:bg-indigo-50 transition ${
+                    activeThread?.id === t.id ? 'bg-indigo-50' : ''
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="font-medium text-gray-900">
+                      {t.isGroup ? (t.title || 'Group chat') : (t.members?.find((m: any) => m.userId !== user?.id)?.user?.fullName || 'Direct message')}
+                    </div>
+                    {t.messages?.[0] && (
+                      <div className="text-xs text-gray-500">
+                        {new Date(t.messages[0].createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                      </div>
+                    )}
+                  </div>
+                  {t.messages?.[0]?.body && (
+                    <div className="text-sm text-gray-600 truncate">{t.messages[0].body}</div>
+                  )}
+                </button>
+              ))}
+              {!threads.length && (
+                <div className="p-6 text-sm text-gray-500">No conversations yet.</div>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Chat view */}
+        <Card className="md:col-span-2 bg-white/90 border-gray-200/60 shadow flex flex-col">
+          <CardContent className="p-0 flex-1 flex flex-col">
+            {/* Header */}
+            <div className="p-4 border-b border-gray-100">
+              {activeThread ? (
+                <div className="flex items-center gap-2">
+                  <Users className="w-4 h-4 text-indigo-600" />
+                  <div className="font-semibold text-gray-800">
+                    {activeThread.isGroup ? (activeThread.title || 'Group chat')
+                      : (activeThread.members?.find((m: any) => m.userId !== user?.id)?.user?.fullName || 'Direct message')}
+                  </div>
+                </div>
+              ) : (
+                <div className="text-gray-500">Select a conversation</div>
+              )}
+            </div>
+
+            {/* Messages */}
+            <div className="flex-1 overflow-y-auto p-4 space-y-2">
+              {activeThread ? (
+                messages.map((m) => {
+                  const mine = m.authorId === user?.id;
+                  const show = user?.age_mode === 'YOUTH' && m.safeBody ? m.safeBody : (m.body || '');
+                  return (
+                    <div key={m.id} className={`max-w-[80%] ${mine ? 'ml-auto' : ''}`}>
+                      <div className={`px-3 py-2 rounded-2xl shadow ${mine ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-800'}`}>
+                        <div className="whitespace-pre-wrap break-words">{show}</div>
+                      </div>
+                      <div className={`text-[10px] mt-1 text-gray-500 ${mine ? 'text-right' : ''}`}>
+                        {new Date(m.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                      </div>
+                    </div>
+                  );
+                })
+              ) : (
+                <div className="text-sm text-gray-500 p-4">No thread selected.</div>
+              )}
+            </div>
+
+            {/* Typing indicator */}
+            {!!typingUserIds.length && activeThread && (
+              <div className="px-4 pb-1 text-xs text-gray-500">
+                Someone is typing...
+              </div>
+            )}
+
+            {/* Composer */}
+            {activeThread && (
+              <div className="p-3 border-t border-gray-100 flex gap-2">
+                <Input
+                  placeholder="Write a message…"
+                  value={composer}
+                  onChange={(e) => { setComposer(e.target.value); sendTyping(); }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      sendMessage();
+                    }
+                  }}
+                />
+                <Button onClick={sendMessage} disabled={sending || !composer.trim()}>
+                  {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                </Button>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+
+--------------------------------------------------------------------------------
+FRONTEND — NOTIFICATION BELL (apps/web/src/components/notifications/NotificationsBell.tsx)
+--------------------------------------------------------------------------------
+import React, { useEffect, useState } from 'react';
+import { Bell } from 'lucide-react';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { Button } from '@/components/ui/button';
+import { NotificationsAPI } from '@/lib/api/notifications';
+
+export function NotificationsBell() {
+  const [items, setItems] = useState<any[]>([]);
+  const [unread, setUnread] = useState(0);
+
+  const refresh = async () => {
+    const list = await NotificationsAPI.list();
+    setItems(list);
+    setUnread(list.filter((i: any) => !i.readAt).length);
+  };
+
+  useEffect(() => { refresh(); }, []);
+
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button variant="ghost" className="relative">
+          <Bell className="w-5 h-5" />
+          {unread > 0 && <span className="absolute -top-1 -right-1 bg-red-500 text-white text-[10px] px-1.5 py-0.5 rounded-full">{unread}</span>}
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-80">
+        <div className="flex items-center justify-between mb-2">
+          <div className="font-semibold">Notifications</div>
+          <Button size="sm" variant="ghost" onClick={async () => { await NotificationsAPI.markAllRead(); refresh(); }}>Mark all read</Button>
+        </div>
+        <div className="max-h-80 overflow-y-auto space-y-2">
+          {items.map((n: any) => (
+            <div key={n.id} className="p-2 rounded border text-sm">
+              <div className="font-medium">{n.title || n.type}</div>
+              {n.body && <div className="text-gray-600">{n.body}</div>}
+              <div className="text-[10px] text-gray-500 mt-1">{new Date(n.createdAt).toLocaleString()}</div>
+            </div>
+          ))}
+          {!items.length && <div className="text-sm text-gray-500">No notifications</div>}
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+
+--------------------------------------------------------------------------------
+FRONTEND — NAV INTEGRATION (example)
+--------------------------------------------------------------------------------
+// Add to your sidebar/topbar (where appropriate)
+/*
+import { NotificationsBell } from '@/components/notifications/NotificationsBell';
+...
+<div className="ml-auto flex items-center">
+  <NotificationsBell />
+</div>
+*/
+
+
+--------------------------------------------------------------------------------
+ENV & CONFIG
+--------------------------------------------------------------------------------
+# .env (backend)
+# VITE_WS_URL is used by frontend; backend gateway uses default unless overridden.
+# No secrets here; auth is handled by your existing JWT/middleware stack.
+
+# .env (frontend)
+VITE_WS_URL=
+
+If VITE_WS_URL is blank, the socket client will use window.location.origin.
+
+
+--------------------------------------------------------------------------------
+MIGRATION & WIRING STEPS
+--------------------------------------------------------------------------------
+1) Merge Prisma schema patch, then run:
+   npx prisma migrate dev -n "messaging_and_notifications"
+
+2) Ensure MessagingModule and NotificationsModule are registered in the API app root module:
+   // apps/api/src/app.module.ts
+   import { MessagingModule } from './modules/messaging/messaging.module';
+   import { NotificationsModule } from './modules/notifications/notifications.module';
+   @Module({
+     imports: [
+       // ...other modules
+       MessagingModule,
+       NotificationsModule,
+     ],
+   })
+
+3) Ensure your auth layer sets CurrentUser decorator (already used across other bundles).
+
+4) Frontend:
+   - Add routes for /messages to render <MessagesPage />.
+   - Add <NotificationsBell /> to your top bar.
+   - Ensure api transport baseURL points to your backend.
+
+5) Test happy path:
+   - Create a thread via POST /threads with two user IDs (use your user + a test user).
+   - Open /messages as each user in two windows; send messages and verify real-time delivery.
+   - Switch one user to age_mode=YOUTH and send messages containing an email/phone => text should be redacted for that user; a MessageFlag row should be created.
+
+
+--------------------------------------------------------------------------------
+NOTES & NEXT
+--------------------------------------------------------------------------------
+- This bundle focuses on core messaging + notifications + youth safety basics.
+- Future bundles can extend with media uploads, message reactions, read receipts (per-recipient), and an abuse reporting dashboard for moderators (tying into your trust & safety systems).
+- To scale sockets, mount Socket.IO with Redis adapter; the gateway is written so it’s easy to swap in.
+
+================================================================================
+END OF BUNDLE 08

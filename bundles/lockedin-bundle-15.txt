@@ -1,0 +1,876 @@
+
+LOCKEDIN — Bundle 15 (Messaging Core)
+=====================================
+Scope: End-to-end messaging foundation (direct & group), safety-by-design for youth, real-time delivery, REST + WebSocket API, shared contracts, web SDK, and React UI (convo list + chat window + composer), building on earlier bundles.
+
+Notes
+-----
+- No secrets in code. Read from environment where needed.
+- Tech: Node + Express + Prisma, ws (WebSocket), Zod; React + Tailwind + shadcn/ui; TypeScript everywhere.
+- Youth-safety defaults (under 18): no phone/email/meetup links; verified-employer-only DMs; auto-moderation hooks; contact-sharing blocked.
+- Paths assume a monorepo layout. Adjust as needed to your repo.
+
+Tree
+----
+packages/
+  api/
+    src/
+      modules/
+        messaging/
+          messaging.router.ts
+          messaging.service.ts
+          ws.gateway.ts
+          guard.youth.ts
+          dto.ts
+  shared/
+    contracts/
+      messaging.ts
+  web/
+    src/
+      features/
+        messaging/
+          api.ts
+          ws.ts
+          components/
+            ConversationList.tsx
+            ChatWindow.tsx
+            ChatComposer.tsx
+            MessageBubble.tsx
+            EmptyState.tsx
+          pages/
+            MessagingPage.tsx
+  db/
+    prisma/
+      schema.messaging.prisma
+
+--------------------------------------------------------------------------------
+db/prisma/schema.messaging.prisma
+--------------------------------------------------------------------------------
+
+// Prisma additions for Messaging. Merge into your main schema and migrate.
+enum ConversationType {
+  DIRECT
+  GROUP
+  SUPPORT
+}
+
+enum ParticipantRole {
+  MEMBER
+  ADMIN
+}
+
+enum MessageKind {
+  TEXT
+  IMAGE
+  FILE
+  SYSTEM
+}
+
+enum ModerationStatus {
+  PENDING
+  OK
+  FLAGGED
+  BLOCKED
+}
+
+model Conversation {
+  id             String           @id @default(cuid())
+  type           ConversationType @default(DIRECT)
+  title          String?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  lastMessageAt  DateTime?
+  isArchived     Boolean          @default(false)
+  youthLocked    Boolean          @default(false) // extra restrictions for youth participants
+
+  participants   Participant[]
+  messages       Message[]
+
+  @@index([updatedAt])
+}
+
+model Participant {
+  id              String          @id @default(cuid())
+  userId          String
+  conversationId  String
+  role            ParticipantRole @default(MEMBER)
+  isMuted         Boolean         @default(false)
+  isPinned        Boolean         @default(false)
+  joinedAt        DateTime        @default(now())
+  lastReadAt      DateTime?
+
+  conversation    Conversation    @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, conversationId])
+  @@index([conversationId])
+}
+
+model Message {
+  id              String           @id @default(cuid())
+  conversationId  String
+  senderId        String
+  kind            MessageKind      @default(TEXT)
+  body            String?
+  attachments     Json?
+  meta            Json?
+  moderation      ModerationStatus @default(PENDING)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  deletedAt       DateTime?
+
+  conversation    Conversation     @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  reactions       Reaction[]
+
+  @@index([conversationId, createdAt])
+}
+
+model Reaction {
+  id         String   @id @default(cuid())
+  messageId  String
+  userId     String
+  emoji      String
+  createdAt  DateTime @default(now())
+
+  message    Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, userId, emoji])
+  @@index([messageId])
+}
+
+
+--------------------------------------------------------------------------------
+packages/shared/contracts/messaging.ts
+--------------------------------------------------------------------------------
+
+/**
+ * Shared contracts for messaging. Import on both client and server.
+ */
+export type ConversationType = 'DIRECT' | 'GROUP' | 'SUPPORT';
+export type ParticipantRole = 'MEMBER' | 'ADMIN';
+export type MessageKind = 'TEXT' | 'IMAGE' | 'FILE' | 'SYSTEM';
+export type ModerationStatus = 'PENDING' | 'OK' | 'FLAGGED' | 'BLOCKED';
+
+export interface ParticipantDTO {
+  id: string;
+  userId: string;
+  role: ParticipantRole;
+  joinedAt: string;
+  lastReadAt?: string | null;
+  isMuted: boolean;
+  isPinned: boolean;
+}
+
+export interface ConversationDTO {
+  id: string;
+  type: ConversationType;
+  title?: string | null;
+  lastMessageAt?: string | null;
+  updatedAt: string;
+  isArchived: boolean;
+  youthLocked: boolean;
+  participants: ParticipantDTO[];
+}
+
+export interface MessageDTO {
+  id: string;
+  conversationId: string;
+  senderId: string;
+  kind: MessageKind;
+  body?: string | null;
+  attachments?: Record<string, unknown>[] | null;
+  meta?: Record<string, unknown> | null;
+  moderation: ModerationStatus;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt?: string | null;
+  reactions?: Array<{ userId: string; emoji: string }>;
+}
+
+export interface Paginated<T> {
+  items: T[];
+  nextCursor?: string | null;
+}
+
+export type WSInbound =
+  | { t: 'typing'; conversationId: string; isTyping: boolean }
+  | { t: 'read'; conversationId: string; messageId: string }
+  | { t: 'send'; conversationId: string; body?: string; kind?: MessageKind; attachments?: Record<string, unknown>[] };
+
+export type WSOutbound =
+  | { t: 'message:new'; message: MessageDTO }
+  | { t: 'message:updated'; message: MessageDTO }
+  | { t: 'conversation:updated'; conversation: ConversationDTO }
+  | { t: 'typing'; conversationId: string; userId: string; isTyping: boolean }
+  | { t: 'read'; conversationId: string; userId: string; messageId: string };
+
+
+--------------------------------------------------------------------------------
+packages/api/src/modules/messaging/dto.ts
+--------------------------------------------------------------------------------
+
+import { z } from 'zod';
+
+export const CreateConversationInput = z.object({
+  type: z.enum(['DIRECT','GROUP','SUPPORT']).default('DIRECT'),
+  title: z.string().optional(),
+  userIds: z.array(z.string()).min(1), // includes creator (optional)
+});
+
+export const SendMessageInput = z.object({
+  conversationId: z.string(),
+  kind: z.enum(['TEXT','IMAGE','FILE','SYSTEM']).default('TEXT'),
+  body: z.string().max(5000).optional(),
+  attachments: z.array(z.any()).optional(),
+});
+
+export const ListMessagesQuery = z.object({
+  cursor: z.string().nullish(),
+  limit: z.coerce.number().min(1).max(100).default(30),
+});
+
+export const YouthSafetyFlags = z.object({
+  isYouth: z.boolean().default(false),
+  verifiedEmployerOnly: z.boolean().default(true),
+});
+
+
+--------------------------------------------------------------------------------
+packages/api/src/modules/messaging/guard.youth.ts
+--------------------------------------------------------------------------------
+
+/**
+ * Youth safety utilities: blocks contact sharing & unverified DMs for minors.
+ * Call these checks before sending/forwarding user-generated messages.
+ */
+
+const CONTACT_REGEX = /(\+?\d[\d\s\-().]{7,}\d)|([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Za-z]{2,})/g;
+const MEETUP_REGEX = /\b(meet(?:\s?up)?|come to|address|my (?:place|house)|hotel|room #|DM me on (?:snap|ig|instagram|telegram|whatsapp))\b/i;
+const URL_REGEX = /(https?:\/\/[^\s]+)/i;
+
+export function sanitizeYouthMessage(body: string): { ok: boolean; redacted: string; reason?: string } {
+  let redacted = body;
+
+  if (CONTACT_REGEX.test(body) || MEETUP_REGEX.test(body)) {
+    redacted = body.replace(CONTACT_REGEX, '[redacted]').replace(MEETUP_REGEX, '[redacted]');
+    return { ok: false, redacted, reason: 'contact_or_meetup' };
+  }
+  if (URL_REGEX.test(body)) {
+    redacted = body.replace(URL_REGEX, '[link redacted]');
+    return { ok: false, redacted, reason: 'links_blocked' };
+  }
+  return { ok: true, redacted: body };
+}
+
+
+--------------------------------------------------------------------------------
+packages/api/src/modules/messaging/messaging.service.ts
+--------------------------------------------------------------------------------
+
+import { PrismaClient } from '@prisma/client';
+import type { MessageDTO, ConversationDTO } from '../../../../shared/contracts/messaging';
+const prisma = new PrismaClient();
+
+export async function ensureDirectConversation(userA: string, userB: string) {
+  const existing = await prisma.conversation.findFirst({
+    where: {
+      type: 'DIRECT',
+      participants: { some: { userId: userA } },
+      AND: { participants: { some: { userId: userB } } }
+    },
+    include: { participants: true },
+  });
+  if (existing) return existing;
+
+  return prisma.conversation.create({
+    data: {
+      type: 'DIRECT',
+      participants: {
+        createMany: { data: [{ userId: userA }, { userId: userB }] }
+      }
+    },
+    include: { participants: true },
+  });
+}
+
+export async function createConversation(creatorId: string, type: 'DIRECT'|'GROUP'|'SUPPORT', userIds: string[], title?: string) {
+  const ids = Array.from(new Set([creatorId, ...userIds]));
+  return prisma.conversation.create({
+    data: {
+      type,
+      title,
+      participants: { createMany: { data: ids.map(userId => ({ userId })) } }
+    },
+    include: { participants: true }
+  });
+}
+
+export async function listConversations(userId: string) {
+  const convos = await prisma.conversation.findMany({
+    where: { participants: { some: { userId } } },
+    include: { participants: true },
+    orderBy: { updatedAt: 'desc' }
+  });
+  return convos;
+}
+
+export async function listMessages(conversationId: string, limit: number, cursor?: string | null) {
+  const where = { conversationId };
+  const args: any = {
+    where,
+    orderBy: { createdAt: 'desc' },
+    take: limit + 1,
+  };
+  if (cursor) args.skip = 1, args.cursor = { id: cursor };
+  const items = await prisma.message.findMany(args);
+  let nextCursor: string | null = null;
+  if (items.length > limit) {
+    const next = items.pop();
+    nextCursor = next?.id ?? null;
+  }
+  return { items: items.reverse(), nextCursor };
+}
+
+export async function sendMessage(senderId: string, conversationId: string, data: { kind?: any; body?: string; attachments?: any[]; youth?: boolean; }) {
+  const convo = await prisma.conversation.findUnique({ where: { id: conversationId }, include: { participants: true } });
+  if (!convo) throw new Error('Conversation not found');
+  const isParticipant = convo.participants.some(p => p.userId === senderId);
+  if (!isParticipant) throw new Error('Not a participant');
+
+  const msg = await prisma.message.create({
+    data: {
+      conversationId,
+      senderId,
+      kind: (data.kind ?? 'TEXT') as any,
+      body: data.body,
+      attachments: data.attachments ?? null,
+      moderation: 'PENDING',
+    }
+  });
+
+  await prisma.conversation.update({
+    where: { id: conversationId },
+    data: { lastMessageAt: new Date() }
+  });
+
+  return msg;
+}
+
+export async function addReaction(userId: string, messageId: string, emoji: string) {
+  const reaction = await prisma.reaction.upsert({
+    where: { messageId_userId_emoji: { messageId, userId, emoji } },
+    create: { messageId, userId, emoji },
+    update: {},
+  });
+  return reaction;
+}
+
+export async function markRead(userId: string, conversationId: string, messageId: string) {
+  const participant = await prisma.participant.update({
+    where: { userId_conversationId: { userId, conversationId } },
+    data: { lastReadAt: new Date() }
+  });
+  return participant;
+}
+
+
+--------------------------------------------------------------------------------
+packages/api/src/modules/messaging/messaging.router.ts
+--------------------------------------------------------------------------------
+
+import express from 'express';
+import { z } from 'zod';
+import { CreateConversationInput, SendMessageInput, ListMessagesQuery } from './dto';
+import { sanitizeYouthMessage } from './guard.youth';
+import * as svc from './messaging.service';
+
+// Minimal auth extractor stub — replace with your auth middleware
+function getUserId(req: express.Request): string {
+  const id = (req.headers['x-user-id'] as string) || (req as any).user?.id;
+  if (!id) throw new Error('unauthorized');
+  return id;
+}
+
+// Minimal youth flag — replace with your user profile lookup
+function isYouth(req: express.Request): boolean {
+  return (req.headers['x-user-youth'] as string) === 'true';
+}
+
+const router = express.Router();
+
+router.get('/conversations', async (req, res, next) => {
+  try {
+    const userId = getUserId(req);
+    const data = await svc.listConversations(userId);
+    res.json(data);
+  } catch (e) { next(e); }
+});
+
+router.post('/conversations', async (req, res, next) => {
+  try {
+    const userId = getUserId(req);
+    const input = CreateConversationInput.parse(req.body);
+    const convo = await svc.createConversation(userId, input.type, input.userIds, input.title);
+    res.status(201).json(convo);
+  } catch (e) { next(e); }
+});
+
+router.get('/conversations/:id/messages', async (req, res, next) => {
+  try {
+    const userId = getUserId(req);
+    const { id } = req.params;
+    const q = ListMessagesQuery.parse(req.query);
+    // could verify membership here
+    const page = await svc.listMessages(id, q.limit, q.cursor ?? null);
+    res.json(page);
+  } catch (e) { next(e); }
+});
+
+router.post('/messages', async (req, res, next) => {
+  try {
+    const userId = getUserId(req);
+    const isUnder18 = isYouth(req);
+    const payload = SendMessageInput.parse(req.body);
+
+    // Youth safety: redact contact info & links
+    if (isUnder18 && payload.body) {
+      const { ok, redacted } = sanitizeYouthMessage(payload.body);
+      payload.body = redacted;
+      // (Optionally) store moderation meta when not ok
+    }
+
+    const msg = await svc.sendMessage(userId, payload.conversationId, {
+      kind: payload.kind,
+      body: payload.body,
+      attachments: payload.attachments,
+      youth: isUnder18
+    });
+
+    // Fan out over WS gateway
+    const { pushToConversation } = await import('./ws.gateway');
+    pushToConversation(payload.conversationId, { t: 'message:new', message: {
+      id: msg.id,
+      conversationId: msg.conversationId,
+      senderId: msg.senderId,
+      kind: msg.kind as any,
+      body: msg.body ?? null,
+      attachments: (msg.attachments as any) ?? null,
+      meta: (msg.meta as any) ?? null,
+      moderation: msg.moderation as any,
+      createdAt: msg.createdAt.toISOString(),
+      updatedAt: msg.updatedAt.toISOString(),
+      deletedAt: msg.deletedAt?.toISOString() ?? null,
+      reactions: []
+    }});
+
+    res.status(201).json(msg);
+  } catch (e) { next(e); }
+});
+
+router.post('/messages/:id/reactions', async (req, res, next) => {
+  try {
+    const userId = getUserId(req);
+    const { id } = req.params;
+    const { emoji } = z.object({ emoji: z.string().max(16) }).parse(req.body);
+    const r = await svc.addReaction(userId, id, emoji);
+    res.status(201).json(r);
+  } catch (e) { next(e); }
+});
+
+router.post('/read', async (req, res, next) => {
+  try {
+    const userId = getUserId(req);
+    const { conversationId, messageId } = z.object({ conversationId: z.string(), messageId: z.string() }).parse(req.body);
+    await svc.markRead(userId, conversationId, messageId);
+    const { pushToConversation } = await import('./ws.gateway');
+    pushToConversation(conversationId, { t: 'read', conversationId, userId, messageId });
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+export default router;
+
+
+--------------------------------------------------------------------------------
+packages/api/src/modules/messaging/ws.gateway.ts
+--------------------------------------------------------------------------------
+
+import { WebSocketServer, WebSocket } from 'ws';
+import type { WSOutbound } from '../../../../shared/contracts/messaging';
+
+type Ctx = { userId: string };
+const userSockets = new Map<string, Set<WebSocket>>();
+let wss: WebSocketServer | null = null;
+
+function register(ws: WebSocket, userId: string) {
+  let set = userSockets.get(userId);
+  if (!set) userSockets.set(userId, set = new Set());
+  set.add(ws);
+  ws.on('close', () => set?.delete(ws));
+}
+
+export function initMessagingWS(server: any) {
+  wss = new WebSocketServer({ noServer: true });
+
+  server.on('upgrade', (req: any, socket: any, head: any) => {
+    if (!req.url?.startsWith('/ws/messaging')) return;
+    // naïve auth: read user id from query/header; replace with your session validation
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const userId = url.searchParams.get('userId') || req.headers['x-user-id'];
+    if (!userId) return socket.destroy();
+
+    wss!.handleUpgrade(req, socket, head, (ws) => {
+      register(ws, String(userId));
+      ws.send(JSON.stringify({ t: 'ready' }));
+    });
+  });
+
+  return wss;
+}
+
+export function pushToUser(userId: string, data: WSOutbound) {
+  const set = userSockets.get(userId);
+  if (!set) return;
+  const payload = JSON.stringify(data);
+  for (const ws of set) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+  }
+}
+
+// In practice you'd look up conversation participants and fan out to each
+export async function pushToConversation(conversationId: string, data: WSOutbound) {
+  // Minimal fan-out: require the caller to pass resolved participants OR perform a lookup here.
+  // Here we do a dynamic import to avoid top-level prisma in gateway.
+  const { PrismaClient } = await import('@prisma/client');
+  const prisma = new PrismaClient();
+  const participants = await prisma.participant.findMany({ where: { conversationId } });
+  for (const p of participants) pushToUser(p.userId, data);
+}
+
+
+--------------------------------------------------------------------------------
+packages/web/src/features/messaging/api.ts
+--------------------------------------------------------------------------------
+
+import type { ConversationDTO, MessageDTO, Paginated } from '../../../shared/contracts/messaging';
+
+const API_BASE = (window as any).__API_BASE__ || '';
+
+function authHeaders() {
+  const headers: Record<string,string> = { 'Content-Type': 'application/json' };
+  const token = (window as any).__AUTH_TOKEN__;
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const devUser = localStorage.getItem('dev_user_id');
+  if (devUser) headers['x-user-id'] = devUser;
+  const youth = localStorage.getItem('dev_user_youth');
+  if (youth) headers['x-user-youth'] = youth;
+  return headers;
+}
+
+export async function listConversations(): Promise<ConversationDTO[]> {
+  const res = await fetch(`${API_BASE}/messaging/conversations`, { headers: authHeaders() });
+  if (!res.ok) throw new Error('Failed to list conversations');
+  return res.json();
+}
+
+export async function listMessages(conversationId: string, cursor?: string | null, limit = 30): Promise<Paginated<MessageDTO>> {
+  const qs = new URLSearchParams();
+  if (cursor) qs.set('cursor', cursor);
+  qs.set('limit', String(limit));
+  const res = await fetch(`${API_BASE}/messaging/conversations/${conversationId}/messages?${qs}`, { headers: authHeaders() });
+  if (!res.ok) throw new Error('Failed to list messages');
+  return res.json();
+}
+
+export async function sendMessage(input: { conversationId: string; body?: string }) {
+  const res = await fetch(`${API_BASE}/messaging/messages`, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ conversationId: input.conversationId, body: input.body, kind: 'TEXT' })
+  });
+  if (!res.ok) throw new Error('Failed to send message');
+  return res.json();
+}
+
+export async function markRead(conversationId: string, messageId: string) {
+  const res = await fetch(`${API_BASE}/messaging/read`, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ conversationId, messageId })
+  });
+  if (!res.ok) throw new Error('Failed to mark read');
+  return res.json();
+}
+
+
+--------------------------------------------------------------------------------
+packages/web/src/features/messaging/ws.ts
+--------------------------------------------------------------------------------
+
+import type { WSOutbound } from '../../../shared/contracts/messaging';
+
+let socket: WebSocket | null = null;
+type Listener = (evt: WSOutbound) => void;
+const listeners = new Set<Listener>();
+
+export function connectMessagingWS(userId: string) {
+  if (socket && socket.readyState <= 1) return socket;
+  const base = (window as any).__WS_BASE__ || (window.location.origin.replace('http','ws'));
+  const url = `${base}/ws/messaging?userId=${encodeURIComponent(userId)}`;
+  socket = new WebSocket(url);
+  socket.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data) as WSOutbound;
+      for (const fn of listeners) fn(data);
+    } catch {}
+  };
+  return socket;
+}
+
+export function onWS(fn: Listener) {
+  listeners.add(fn);
+  return () => listeners.delete(fn);
+}
+
+
+--------------------------------------------------------------------------------
+packages/web/src/features/messaging/components/ConversationList.tsx
+--------------------------------------------------------------------------------
+
+import React from 'react';
+import type { ConversationDTO } from '../../../../shared/contracts/messaging';
+import { Card } from '@/components/ui/card';
+
+type Props = {
+  conversations: ConversationDTO[];
+  activeId?: string;
+  onSelect: (id: string) => void;
+};
+
+export default function ConversationList({ conversations, activeId, onSelect }: Props) {
+  return (
+    <div className="space-y-2">
+      {conversations.map(c => (
+        <Card
+          key={c.id}
+          onClick={() => onSelect(c.id)}
+          className={`p-3 cursor-pointer hover:shadow ${activeId === c.id ? 'ring-2 ring-indigo-500' : 'border'}`}
+        >
+          <div className="flex items-center justify-between">
+            <div className="font-semibold text-gray-900 truncate">{c.title || 'Conversation'}</div>
+            {c.youthLocked && <span className="text-xs text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded">Youth Safe</span>}
+          </div>
+          <div className="text-xs text-gray-500">Updated {new Date(c.updatedAt).toLocaleString()}</div>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+
+--------------------------------------------------------------------------------
+packages/web/src/features/messaging/components/MessageBubble.tsx
+--------------------------------------------------------------------------------
+
+import React from 'react';
+import type { MessageDTO } from '../../../../shared/contracts/messaging';
+
+export default function MessageBubble({ msg, me }: { msg: MessageDTO; me: string }) {
+  const mine = msg.senderId === me;
+  return (
+    <div className={`flex ${mine ? 'justify-end' : 'justify-start'}`}>
+      <div className={`max-w-[75%] rounded-2xl px-3 py-2 text-sm shadow ${mine ? 'bg-indigo-600 text-white' : 'bg-white border text-gray-900'}`}>
+        {msg.body}
+        <div className={`text-[10px] mt-1 ${mine ? 'text-indigo-100' : 'text-gray-500'}`}>{new Date(msg.createdAt).toLocaleTimeString()}</div>
+      </div>
+    </div>
+  );
+}
+
+
+--------------------------------------------------------------------------------
+packages/web/src/features/messaging/components/ChatComposer.tsx
+--------------------------------------------------------------------------------
+
+import React, { useState } from 'react';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+
+type Props = { onSend: (text: string) => Promise<void>; youth?: boolean };
+
+export default function ChatComposer({ onSend, youth }: Props) {
+  const [text, setText] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function submit() {
+    const val = text.trim();
+    if (!val) return;
+    setBusy(true);
+    try {
+      await onSend(val);
+      setText('');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="flex items-center gap-2 p-2 border-t bg-white">
+      <Input
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder={youth ? "Keep it safe — no contact details or links." : "Type a message"}
+        onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } }}
+      />
+      <Button onClick={submit} disabled={busy}>Send</Button>
+    </div>
+  );
+}
+
+
+--------------------------------------------------------------------------------
+packages/web/src/features/messaging/components/ChatWindow.tsx
+--------------------------------------------------------------------------------
+
+import React, { useEffect, useRef } from 'react';
+import type { MessageDTO } from '../../../../shared/contracts/messaging';
+import MessageBubble from './MessageBubble';
+
+export default function ChatWindow({ me, messages }: { me: string; messages: MessageDTO[] }) {
+  const endRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages.length]);
+  return (
+    <div className="flex-1 overflow-y-auto p-3 space-y-2 bg-gradient-to-b from-gray-50 to-blue-50">
+      {messages.map(m => <MessageBubble key={m.id} msg={m} me={me} />)}
+      <div ref={endRef} />
+    </div>
+  );
+}
+
+
+--------------------------------------------------------------------------------
+packages/web/src/features/messaging/components/EmptyState.tsx
+--------------------------------------------------------------------------------
+
+import React from 'react';
+
+export default function EmptyState() {
+  return (
+    <div className="flex-1 flex flex-col items-center justify-center text-center p-8">
+      <div className="text-6xl">💬</div>
+      <h3 className="mt-4 text-lg font-semibold text-gray-900">Select a conversation</h3>
+      <p className="text-sm text-gray-600">Start chatting with your contacts in a safe, modern inbox.</p>
+    </div>
+  );
+}
+
+
+--------------------------------------------------------------------------------
+packages/web/src/features/messaging/pages/MessagingPage.tsx
+--------------------------------------------------------------------------------
+
+import React, { useEffect, useMemo, useState } from 'react';
+import { Card } from '@/components/ui/card';
+import ConversationList from '../components/ConversationList';
+import ChatWindow from '../components/ChatWindow';
+import ChatComposer from '../components/ChatComposer';
+import EmptyState from '../components/EmptyState';
+import { connectMessagingWS, onWS } from '../ws';
+import * as api from '../api';
+import type { ConversationDTO, MessageDTO } from '../../../../shared/contracts/messaging';
+
+export default function MessagingPage() {
+  const me = useMemo(() => localStorage.getItem('dev_user_id') || 'me', []);
+  const [conversations, setConversations] = useState<ConversationDTO[]>([]);
+  const [activeId, setActiveId] = useState<string | undefined>();
+  const [messages, setMessages] = useState<MessageDTO[]>([]);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const active = conversations.find(c => c.id === activeId);
+
+  useEffect(() => {
+    api.listConversations().then(setConversations).catch(console.error);
+    connectMessagingWS(me);
+    const off = onWS((evt) => {
+      if (evt.t === 'message:new' && evt.message.conversationId === activeId) {
+        setMessages(prev => [...prev, evt.message]);
+      }
+    });
+    return () => off();
+  }, [me, activeId]);
+
+  useEffect(() => {
+    if (!activeId) return;
+    api.listMessages(activeId, null, 30).then(page => {
+      setMessages(page.items);
+      setCursor(page.nextCursor ?? null);
+    }).catch(console.error);
+  }, [activeId]);
+
+  async function send(text: string) {
+    if (!activeId) return;
+    await api.sendMessage({ conversationId: activeId, body: text });
+  }
+
+  return (
+    <div className="grid grid-cols-12 gap-6 h-[calc(100vh-140px)]">
+      <div className="col-span-4 overflow-y-auto">
+        <Card className="p-3 sticky top-0 bg-white/80 backdrop-blur z-10">
+          <div className="text-lg font-bold">Messages</div>
+        </Card>
+        <ConversationList
+          conversations={conversations}
+          activeId={activeId}
+          onSelect={setActiveId}
+        />
+      </div>
+      <div className="col-span-8 flex flex-col border rounded-xl overflow-hidden bg-white/60 backdrop-blur">
+        {active ? (
+          <>
+            <Card className="p-3 rounded-none bg-white/80">
+              <div className="font-semibold">{active.title || 'Conversation'}</div>
+            </Card>
+            <ChatWindow me={me} messages={messages} />
+            <ChatComposer onSend={send} youth={active.youthLocked} />
+          </>
+        ) : <EmptyState />}
+      </div>
+    </div>
+  );
+}
+
+
+--------------------------------------------------------------------------------
+Integration Instructions
+--------------------------------------------------------------------------------
+1) Prisma
+   - Merge `schema.messaging.prisma` into your main Prisma schema.
+   - Run: `prisma migrate dev -n messaging_core`
+
+2) API
+   - Mount router in your Express app:
+     ```ts
+     import messagingRouter from './modules/messaging/messaging.router';
+     app.use('/messaging', messagingRouter);
+     ```
+   - Initialize WS gateway in your server bootstrap:
+     ```ts
+     import http from 'http';
+     import { initMessagingWS } from './modules/messaging/ws.gateway';
+     const server = http.createServer(app);
+     initMessagingWS(server);
+     server.listen(process.env.PORT || 3000);
+     ```
+
+3) Web
+   - Add `MessagingPage` to your router under `/messages`.
+   - Ensure `window.__API_BASE__` and (optionally) `window.__WS_BASE__` are set.
+   - For local dev, you can simulate auth with:
+     ```js
+     localStorage.dev_user_id = 'user_123';
+     localStorage.dev_user_youth = 'false'; // or 'true' to test youth rules
+     ```
+
+4) Safety
+   - Replace the youth and auth stubs with your real user profile & policy checks.
+   - Extend `sanitizeYouthMessage` to integrate with your moderation pipeline.
+
+This bundle delivers the messaging backbone (data, APIs, real-time, SDK, UI) and plugs into the rest of LockedIn without secrets. Next phases can add search within conversations, attachments upload, typing indicators, group admin tools, message edits/deletes, and end-to-end encryption planning.

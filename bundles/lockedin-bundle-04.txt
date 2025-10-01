@@ -1,0 +1,981 @@
+----- /README-bundle04.md -----
+# Bundle 04 — Resume Builder, Tailoring & Document Service
+
+This bundle adds:
+- **Resume & Cover Letter data models** (Prisma add-on schema).
+- **Resume API** (NestJS): CRUD, clone, versioning, tailor-to-job, keyword matching, export to PDF.
+- **Document Service**: Server-side PDF generation (ATS-friendly) using **pdfkit** (no external API keys).
+- **Storage Abstraction**: Local disk adapter by default (`/apps/api/uploads`). Swap later for S3/GCS.
+- **Front-end Resume Builder**: List, create, edit sections, tailor to a job, export.
+- **Shared Types & FE Entities**: Strong types + thin API client wrappers.
+- **Seed script**: One sample resume.
+
+> No credentials are hard-coded. This bundle runs locally with no secrets. When you later wire an AI provider, put keys in env vars and implement the `AITailorProvider` interface.
+
+## Install deps (root)
+```bash
+pnpm -w add pdfkit @types/pdfkit
+pnpm --filter @lockedin/api add class-validator class-transformer
+```
+
+## Migrations
+Append the `bundle04.prisma` model additions to your `prisma/schema.prisma`, then:
+```bash
+pnpm prisma migrate dev --name bundle04_resumes
+```
+
+## API
+- POST   /resumes
+- GET    /resumes
+- GET    /resumes/:id
+- PATCH  /resumes/:id
+- POST   /resumes/:id/clone
+- POST   /resumes/:id/tailor   { jobId: string }
+- POST   /resumes/:id/export   -> { fileId, url }
+- GET    /documents/:id        (serves the file)
+
+## FE Pages
+- /resumes                      (list + create)
+- /resumes/:id                  (editor)
+- Tailor drawer in editor
+
+## Notes
+- **Youth-safe by default**: Nothing here allows inbound DMs; export URLs are non-guessable UUIDs and short-lived optional in future.
+- **PDF is ATS-friendly**: Simple text layout, no tables/columns that can break parsers.
+- **Templating**: Minimal “template” object with typography knobs. Extend as you like.
+```
+
+----- /prisma/addons/bundle04.prisma -----
+/// Append this to your main schema.prisma (keep your existing datasource/generator).
+model Resume {
+  id              String            @id @default(cuid())
+  userId          String
+  title           String            @default("Base Resume")
+  summary         String?
+  skills          String[]          @default([])
+  experiences     ResumeExperience[]
+  educations      ResumeEducation[]
+  projects        ResumeProject[]
+  links           String[]          @default([])
+  version         Int               @default(1)
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  // convenience
+  applications    Application[]     @relation("ApplicationResume")
+
+  @@index([userId])
+}
+
+model ResumeExperience {
+  id          String   @id @default(cuid())
+  resumeId    String
+  company     String
+  role        String
+  startDate   DateTime
+  endDate     DateTime?
+  highlights  String[] @default([])
+  technologies String[] @default([])
+
+  resume      Resume   @relation(fields: [resumeId], references: [id], onDelete: Cascade)
+}
+
+model ResumeEducation {
+  id          String   @id @default(cuid())
+  resumeId    String
+  school      String
+  degree      String?
+  startDate   DateTime?
+  endDate     DateTime?
+  highlights  String[] @default([])
+
+  resume      Resume   @relation(fields: [resumeId], references: [id], onDelete: Cascade)
+}
+
+model ResumeProject {
+  id          String   @id @default(cuid())
+  resumeId    String
+  name        String
+  url         String?
+  summary     String?
+  highlights  String[] @default([])
+  technologies String[] @default([])
+
+  resume      Resume   @relation(fields: [resumeId], references: [id], onDelete: Cascade)
+}
+
+model DocumentFile {
+  id         String   @id @default(cuid())
+  userId     String
+  kind       DocumentKind
+  filename   String
+  mimetype   String
+  bytes      Int
+  path       String     // local relative path or opaque key
+  createdAt  DateTime   @default(now())
+
+  @@index([userId, kind])
+}
+
+enum DocumentKind {
+  RESUME_PDF
+  COVERLETTER_PDF
+}
+
+/// Optional back-link from Application -> Resume (add if Application exists already)
+model Application {
+  id          String   @id @default(cuid())
+  // ... your existing fields ...
+  resumeId    String?
+  resume      Resume?  @relation("ApplicationResume", fields: [resumeId], references: [id])
+}
+
+----- /packages/types/src/resume.ts -----
+export type ID = string;
+
+export interface ResumeExperience {
+  id: ID;
+  company: string;
+  role: string;
+  startDate: string;
+  endDate?: string | null;
+  highlights: string[];
+  technologies: string[];
+}
+
+export interface ResumeEducation {
+  id: ID;
+  school: string;
+  degree?: string;
+  startDate?: string;
+  endDate?: string;
+  highlights: string[];
+}
+
+export interface ResumeProject {
+  id: ID;
+  name: string;
+  url?: string;
+  summary?: string;
+  highlights: string[];
+  technologies: string[];
+}
+
+export interface Resume {
+  id: ID;
+  userId: ID;
+  title: string;
+  summary?: string;
+  skills: string[];
+  experiences: ResumeExperience[];
+  educations: ResumeEducation[];
+  projects: ResumeProject[];
+  links: string[];
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TailorRequest {
+  jobId: ID;
+}
+
+export interface ExportResponse {
+  fileId: ID;
+  url: string;
+}
+
+----- /packages/types/src/document.ts -----
+export type ID = string;
+
+export type DocumentKind = "RESUME_PDF" | "COVERLETTER_PDF";
+
+export interface DocumentFile {
+  id: ID;
+  userId: ID;
+  kind: DocumentKind;
+  filename: string;
+  mimetype: string;
+  bytes: number;
+  path: string;      // opaque key or relative path
+  createdAt: string;
+}
+
+----- /packages/shared/src/entities/resume.ts -----
+import { http } from "../http";
+import type { Resume, TailorRequest, ExportResponse } from "@lockedin/types/resume";
+
+export const ResumeEntity = {
+  async list(): Promise<Resume[]> {
+    return http.get("/resumes");
+  },
+  async get(id: string): Promise<Resume> {
+    return http.get(`/resumes/${id}`);
+  },
+  async create(payload: Partial<Resume>): Promise<Resume> {
+    return http.post("/resumes", payload);
+  },
+  async update(id: string, payload: Partial<Resume>): Promise<Resume> {
+    return http.patch(`/resumes/${id}`, payload);
+  },
+  async clone(id: string): Promise<Resume> {
+    return http.post(`/resumes/${id}/clone`, {});
+  },
+  async tailor(id: string, body: TailorRequest): Promise<Resume & { fitScore: number; keywordMatches: string[]; missingKeywords: string[]; }> {
+    return http.post(`/resumes/${id}/tailor`, body);
+  },
+  async export(id: string): Promise<ExportResponse> {
+    return http.post(`/resumes/${id}/export`, {});
+  }
+};
+
+----- /apps/api/src/modules/resumes/dto/create-resume.dto.ts -----
+import { IsArray, IsOptional, IsString, IsUrl } from "class-validator";
+
+export class CreateResumeDto {
+  @IsOptional() @IsString() title?: string;
+  @IsOptional() @IsString() summary?: string;
+  @IsOptional() @IsArray() skills?: string[];
+  @IsOptional() @IsArray() experiences?: any[];
+  @IsOptional() @IsArray() educations?: any[];
+  @IsOptional() @IsArray() projects?: any[];
+  @IsOptional() @IsArray() @IsUrl(undefined, { each: true }) links?: string[];
+}
+
+----- /apps/api/src/modules/resumes/dto/update-resume.dto.ts -----
+import { PartialType } from "@nestjs/mapped-types";
+import { CreateResumeDto } from "./create-resume.dto";
+export class UpdateResumeDto extends PartialType(CreateResumeDto) {}
+
+----- /apps/api/src/modules/resumes/resumes.controller.ts -----
+import { Body, Controller, Get, Param, Patch, Post } from "@nestjs/common";
+import { ResumesService } from "./resumes.service";
+import { CreateResumeDto } from "./dto/create-resume.dto";
+import { UpdateResumeDto } from "./dto/update-resume.dto";
+
+@Controller("resumes")
+export class ResumesController {
+  constructor(private readonly resumes: ResumesService) {}
+
+  @Get()
+  list() {
+    return this.resumes.listForMe();
+  }
+
+  @Get(":id")
+  get(@Param("id") id: string) {
+    return this.resumes.getForMe(id);
+  }
+
+  @Post()
+  create(@Body() dto: CreateResumeDto) {
+    return this.resumes.createForMe(dto);
+  }
+
+  @Patch(":id")
+  update(@Param("id") id: string, @Body() dto: UpdateResumeDto) {
+    return this.resumes.updateForMe(id, dto);
+  }
+
+  @Post(":id/clone")
+  clone(@Param("id") id: string) {
+    return this.resumes.cloneForMe(id);
+  }
+
+  @Post(":id/tailor")
+  tailor(@Param("id") id: string, @Body() body: { jobId: string }) {
+    return this.resumes.tailorToJobForMe(id, body.jobId);
+  }
+
+  @Post(":id/export")
+  exportPdf(@Param("id") id: string) {
+    return this.resumes.exportPdfForMe(id);
+  }
+}
+
+----- /apps/api/src/modules/resumes/resumes.module.ts -----
+import { Module } from "@nestjs/common";
+import { ResumesController } from "./resumes.controller";
+import { ResumesService } from "./resumes.service";
+import { TailorService } from "../tailor/tailor.service";
+import { DocumentsModule } from "../documents/documents.module";
+
+@Module({
+  imports: [DocumentsModule],
+  controllers: [ResumesController],
+  providers: [ResumesService, TailorService],
+  exports: [ResumesService]
+})
+export class ResumesModule {}
+
+----- /apps/api/src/modules/resumes/resumes.service.ts -----
+import { Injectable, NotFoundException, ForbiddenException } from "@nestjs/common";
+import { PrismaService } from "../../prisma/prisma.service";
+import { CreateResumeDto } from "./dto/create-resume.dto";
+import { UpdateResumeDto } from "./dto/update-resume.dto";
+import { TailorService } from "../tailor/tailor.service";
+import { DocumentsService } from "../documents/documents.service";
+
+// NOTE: Replace getCurrentUserId() with your real auth context accessor.
+function getCurrentUserId(): string {
+  // In your real app, pull this from request context/session/JWT
+  return "demo-user-id";
+}
+
+@Injectable()
+export class ResumesService {
+  constructor(
+    private prisma: PrismaService,
+    private tailor: TailorService,
+    private docs: DocumentsService
+  ) {}
+
+  async listForMe() {
+    const userId = getCurrentUserId();
+    return this.prisma.resume.findMany({
+      where: { userId },
+      orderBy: { updatedAt: "desc" },
+      include: {
+        experiences: true,
+        educations: true,
+        projects: true
+      }
+    });
+  }
+
+  async getForMe(id: string) {
+    const userId = getCurrentUserId();
+    const resume = await this.prisma.resume.findFirst({
+      where: { id, userId },
+      include: { experiences: true, educations: true, projects: true }
+    });
+    if (!resume) throw new NotFoundException("Resume not found");
+    return resume;
+  }
+
+  async createForMe(dto: CreateResumeDto) {
+    const userId = getCurrentUserId();
+    return this.prisma.resume.create({
+      data: {
+        userId,
+        title: dto.title ?? "Base Resume",
+        summary: dto.summary ?? "",
+        skills: dto.skills ?? [],
+        links: dto.links ?? [],
+        experiences: { create: (dto.experiences ?? []).map((e: any) => ({
+          company: e.company, role: e.role, startDate: e.startDate ? new Date(e.startDate) : new Date(),
+          endDate: e.endDate ? new Date(e.endDate) : null, highlights: e.highlights ?? [], technologies: e.technologies ?? []
+        }))},
+        educations: { create: (dto.educations ?? []).map((e: any) => ({
+          school: e.school, degree: e.degree, startDate: e.startDate ? new Date(e.startDate) : null,
+          endDate: e.endDate ? new Date(e.endDate) : null, highlights: e.highlights ?? []
+        }))},
+        projects: { create: (dto.projects ?? []).map((p: any) => ({
+          name: p.name, url: p.url, summary: p.summary, highlights: p.highlights ?? [], technologies: p.technologies ?? []
+        }))}
+      },
+      include: { experiences: true, educations: true, projects: true }
+    });
+  }
+
+  async updateForMe(id: string, dto: UpdateResumeDto) {
+    const userId = getCurrentUserId();
+    const exists = await this.prisma.resume.findFirst({ where: { id, userId }, select: { id: true }});
+    if (!exists) throw new ForbiddenException("Not allowed");
+
+    // For brevity we update root fields; for child arrays, call dedicated endpoints in v2.
+    return this.prisma.resume.update({
+      where: { id },
+      data: {
+        title: dto.title,
+        summary: dto.summary,
+        skills: dto.skills,
+        links: dto.links
+      },
+      include: { experiences: true, educations: true, projects: true }
+    });
+  }
+
+  async cloneForMe(id: string) {
+    const base = await this.getForMe(id);
+    return this.prisma.$transaction(async (tx) => {
+      const cloned = await tx.resume.create({
+        data: {
+          userId: base.userId,
+          title: base.title + " (Copy)",
+          summary: base.summary,
+          skills: base.skills,
+          links: base.links,
+          version: base.version + 1
+        }
+      });
+      await tx.resumeExperience.createMany({ data: base.experiences.map(e => ({
+        resumeId: cloned.id, company: e.company, role: e.role, startDate: e.startDate, endDate: e.endDate,
+        highlights: e.highlights, technologies: e.technologies
+      }))});
+      await tx.resumeEducation.createMany({ data: base.educations.map(e => ({
+        resumeId: cloned.id, school: e.school, degree: e.degree, startDate: e.startDate, endDate: e.endDate,
+        highlights: e.highlights
+      }))});
+      await tx.resumeProject.createMany({ data: base.projects.map(p => ({
+        resumeId: cloned.id, name: p.name, url: p.url, summary: p.summary, highlights: p.highlights,
+        technologies: p.technologies
+      }))});
+      return this.getForMe(cloned.id);
+    });
+  }
+
+  async tailorToJobForMe(id: string, jobId: string) {
+    const resume = await this.getForMe(id);
+    const job = await this.prisma.job.findUnique({ where: { id: jobId }});
+    if (!job) throw new NotFoundException("Job not found");
+
+    const result = this.tailor.tailor(resume, job);
+    // We don't mutate the resume automatically; client can accept the suggestions.
+    return { ...resume, ...result };
+  }
+
+  async exportPdfForMe(id: string) {
+    const resume = await this.getForMe(id);
+    const file = await this.docs.generateResumePdf(resume);
+    return { fileId: file.id, url: `/documents/${file.id}` };
+  }
+}
+
+----- /apps/api/src/modules/tailor/tailor.service.ts -----
+import { Injectable } from "@nestjs/common";
+
+type Resume = any;
+type Job = any;
+
+function tokenize(text: string): string[] {
+  return (text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+@Injectable()
+export class TailorService {
+  /**
+   * Simple keyword-based tailoring.
+   * - Scores overlap between job description/skills and resume skills/highlights.
+   * - Suggests reordering skills (high priority first) and highlights to bubble relevant content.
+   * This is non-AI by default; you can replace with an AI provider behind the same shape.
+   */
+  tailor(resume: Resume, job: Job) {
+    const jobBlob = [
+      job.title,
+      job.description,
+      ...(job.required_skills || []),
+      ...(job.preferred_skills || [])
+    ].join(" ");
+
+    const jobTokens = new Set(tokenize(jobBlob));
+    const resumeSkills = (resume.skills || []).map((s: string) => s.toLowerCase());
+    const skillMatches = resumeSkills.filter((s: string) => jobTokens.has(s));
+
+    // Collect highlights tokens
+    const highlights = [
+      ...(resume.experiences || []).flatMap((e: any) => e.highlights || []),
+      ...(resume.projects || []).flatMap((p: any) => p.highlights || [])
+    ];
+
+    const highlightMatches = highlights.filter((h: string) => tokenize(h).some(t => jobTokens.has(t)));
+    const matchedTokens = new Set<string>();
+    [...skillMatches, ...highlightMatches.flatMap(h => tokenize(h))].forEach(t => matchedTokens.add(t));
+
+    const jobSkills = new Set<string>([...(job.required_skills || []), ...(job.preferred_skills || [])].map((s: string) => s.toLowerCase()));
+    const missingKeywords = [...jobSkills].filter(s => !resumeSkills.includes(s));
+
+    // Fit score: 60% skills overlap + 40% highlights relevance
+    const skillScore = jobSkills.size ? (skillMatches.length / jobSkills.size) : 0.6;
+    const highlightScore = highlights.length ? (highlightMatches.length / highlights.length) : 0.4;
+    const fitScore = Math.round((skillScore * 0.6 + highlightScore * 0.4) * 100);
+
+    // Suggested ordering: matched-first skills
+    const reorderedSkills = [
+      ...resume.skills.filter((s: string) => skillMatches.includes(s.toLowerCase())),
+      ...resume.skills.filter((s: string) => !skillMatches.includes(s.toLowerCase()))
+    ];
+
+    return {
+      fitScore,
+      keywordMatches: [...matchedTokens],
+      missingKeywords,
+      suggestions: {
+        reorderedSkills
+      }
+    };
+  }
+}
+
+----- /apps/api/src/modules/documents/documents.controller.ts -----
+import { Controller, Get, NotFoundException, Param, Res } from "@nestjs/common";
+import { Response } from "express";
+import { DocumentsService } from "./documents.service";
+
+@Controller("documents")
+export class DocumentsController {
+  constructor(private docs: DocumentsService) {}
+
+  @Get(":id")
+  async get(@Param("id") id: string, @Res() res: Response) {
+    const file = await this.docs.getFileById(id);
+    if (!file) throw new NotFoundException("File not found");
+
+    res.setHeader("Content-Type", file.mimetype);
+    res.setHeader("Content-Disposition", `attachment; filename="${file.filename}"`);
+    return res.sendFile(file.path, { root: process.cwd() });
+  }
+}
+
+----- /apps/api/src/modules/documents/documents.module.ts -----
+import { Module } from "@nestjs/common";
+import { DocumentsService } from "./documents.service";
+import { DocumentsController } from "./documents.controller";
+import { StorageModule } from "../storage/storage.module";
+
+@Module({
+  imports: [StorageModule],
+  providers: [DocumentsService],
+  controllers: [DocumentsController],
+  exports: [DocumentsService]
+})
+export class DocumentsModule {}
+
+----- /apps/api/src/modules/documents/documents.service.ts -----
+import { Injectable } from "@nestjs/common";
+import PDFDocument from "pdfkit";
+import { StorageService } from "../storage/storage.service";
+import { randomUUID } from "crypto";
+
+@Injectable()
+export class DocumentsService {
+  constructor(private storage: StorageService) {}
+
+  async getFileById(id: string) {
+    return this.storage.getMetadata(id);
+  }
+
+  async generateResumePdf(resume: any) {
+    const doc = new PDFDocument({ size: "LETTER", margin: 50 });
+    const chunks: Buffer[] = [];
+    doc.on("data", (chunk) => chunks.push(chunk));
+    const done = new Promise<Buffer>((resolve) => {
+      doc.on("end", () => resolve(Buffer.concat(chunks)));
+    });
+
+    // Header
+    doc.fontSize(20).font("Helvetica-Bold").text(resume.title || "Resume", { align: "left" });
+    doc.moveDown(0.3);
+    doc.fontSize(11).font("Helvetica").fillColor("#444").text(resume.summary || "", { align: "left" });
+    doc.moveDown(0.6);
+
+    // Skills
+    if ((resume.skills || []).length) {
+      doc.fontSize(13).fillColor("#000").font("Helvetica-Bold").text("Skills");
+      doc.moveDown(0.2);
+      doc.fontSize(10).font("Helvetica").fillColor("#111").text(resume.skills.join(", "));
+      doc.moveDown(0.6);
+    }
+
+    // Experience
+    if ((resume.experiences || []).length) {
+      doc.fontSize(13).fillColor("#000").font("Helvetica-Bold").text("Experience");
+      doc.moveDown(0.2);
+      for (const e of resume.experiences) {
+        doc.fontSize(11).font("Helvetica-Bold").text(`${e.role} — ${e.company}`);
+        const range = [e.startDate ? new Date(e.startDate).toLocaleDateString() : "", e.endDate ? new Date(e.endDate).toLocaleDateString() : "Present"].filter(Boolean).join(" – ");
+        doc.fontSize(10).font("Helvetica").fillColor("#555").text(range);
+        for (const h of (e.highlights || [])) {
+          doc.circle(doc.x + 3, doc.y + 6, 1).fill("#333").fill("#000");
+          doc.text(`  ${h}`, { indent: 10 });
+        }
+        if ((e.technologies || []).length) {
+          doc.fillColor("#111").text(`Technologies: ${e.technologies.join(", ")}`);
+        }
+        doc.moveDown(0.4);
+      }
+      doc.moveDown(0.2);
+    }
+
+    // Projects
+    if ((resume.projects || []).length) {
+      doc.fontSize(13).fillColor("#000").font("Helvetica-Bold").text("Projects");
+      doc.moveDown(0.2);
+      for (const p of resume.projects) {
+        doc.fontSize(11).font("Helvetica-Bold").text(p.name);
+        if (p.url) doc.fontSize(10).fillColor("#1f4b99").text(p.url);
+        if (p.summary) doc.fontSize(10).fillColor("#111").text(p.summary);
+        for (const h of (p.highlights || [])) {
+          doc.fillColor("#000").text(`• ${h}`);
+        }
+        if ((p.technologies || []).length) {
+          doc.fillColor("#111").text(`Technologies: ${p.technologies.join(", ")}`);
+        }
+        doc.moveDown(0.4);
+      }
+      doc.moveDown(0.2);
+    }
+
+    // Education
+    if ((resume.educations || []).length) {
+      doc.fontSize(13).fillColor("#000").font("Helvetica-Bold").text("Education");
+      doc.moveDown(0.2);
+      for (const ed of resume.educations) {
+        doc.fontSize(11).font("Helvetica-Bold").text(ed.school + (ed.degree ? ` — ${ed.degree}` : ""));
+        const range = [ed.startDate ? new Date(ed.startDate).toLocaleDateString() : "", ed.endDate ? new Date(ed.endDate).toLocaleDateString() : ""].filter(Boolean).join(" – ");
+        if (range) doc.fontSize(10).font("Helvetica").fillColor("#555").text(range);
+        for (const h of (ed.highlights || [])) {
+          doc.fillColor("#000").text(`• ${h}`);
+        }
+        doc.moveDown(0.3);
+      }
+    }
+
+    doc.end();
+    const buffer = await done;
+
+    const filename = `${(resume.title || "resume").replace(/\s+/g, "_")}.pdf`;
+    const fileId = randomUUID();
+    const saved = await this.storage.save({
+      id: fileId,
+      filename,
+      mimetype: "application/pdf",
+      buffer
+    });
+
+    return saved;
+  }
+}
+
+----- /apps/api/src/modules/storage/storage.module.ts -----
+import { Module } from "@nestjs/common";
+import { StorageService } from "./storage.service";
+import { LocalStorageAdapter } from "./storage.local";
+
+@Module({
+  providers: [
+    StorageService,
+    { provide: "StorageAdapter", useClass: LocalStorageAdapter }
+  ],
+  exports: [StorageService]
+})
+export class StorageModule {}
+
+----- /apps/api/src/modules/storage/storage.service.ts -----
+import { Inject, Injectable } from "@nestjs/common";
+
+export interface SaveParams {
+  id: string;
+  filename: string;
+  mimetype: string;
+  buffer: Buffer;
+}
+
+export interface StorageAdapter {
+  save(params: SaveParams): Promise<{ id: string; path: string; filename: string; mimetype: string; bytes: number; }>;
+  getMetadata(id: string): Promise<{ id: string; path: string; filename: string; mimetype: string; bytes: number; createdAt: Date; } | null>;
+}
+
+@Injectable()
+export class StorageService {
+  constructor(@Inject("StorageAdapter") private adapter: StorageAdapter) {}
+
+  save(params: SaveParams) { return this.adapter.save(params); }
+  getMetadata(id: string) { return this.adapter.getMetadata(id); }
+}
+
+----- /apps/api/src/modules/storage/storage.local.ts -----
+import { Injectable } from "@nestjs/common";
+import { promises as fs } from "fs";
+import * as path from "path";
+import { StorageAdapter, SaveParams } from "./storage.service";
+
+const ROOT = path.join(process.cwd(), "apps", "api", "uploads");
+
+@Injectable()
+export class LocalStorageAdapter implements StorageAdapter {
+  private meta = new Map<string, { id: string; path: string; filename: string; mimetype: string; bytes: number; createdAt: Date; }>();
+
+  async save(params: SaveParams) {
+    await fs.mkdir(ROOT, { recursive: true });
+    const rel = path.join("apps", "api", "uploads", `${params.id}-${params.filename}`);
+    const abs = path.join(process.cwd(), rel);
+    await fs.writeFile(abs, params.buffer);
+    const meta = { id: params.id, path: abs, filename: params.filename, mimetype: params.mimetype, bytes: params.buffer.length, createdAt: new Date() };
+    this.meta.set(params.id, meta);
+    return meta;
+  }
+
+  async getMetadata(id: string) {
+    return this.meta.get(id) || null;
+  }
+}
+
+----- /apps/web/src/pages/Resumes.tsx -----
+import React, { useEffect, useState } from "react";
+import { ResumeEntity } from "@lockedin/shared/entities/resume";
+import type { Resume } from "@lockedin/types/resume";
+import { Link } from "react-router-dom";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { PlusIcon, FileDownIcon, Wand2Icon, CopyIcon, ExternalLinkIcon } from "lucide-react";
+
+export default function ResumesPage() {
+  const [items, setItems] = useState<Resume[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const load = async () => {
+    setLoading(true);
+    try { setItems(await ResumeEntity.list()); } finally { setLoading(false); }
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const create = async () => {
+    await ResumeEntity.create({ title: "Base Resume", skills: [], links: [] });
+    await load();
+  };
+
+  const clone = async (id: string) => {
+    await ResumeEntity.clone(id);
+    await load();
+  };
+
+  const exportPdf = async (id: string) => {
+    const res = await ResumeEntity.export(id);
+    window.open(res.url, "_blank");
+  };
+
+  if (loading) return <div className="p-6">Loading...</div>;
+
+  return (
+    <div className="p-6 md:p-8 max-w-5xl mx-auto">
+      <div className="flex justify-between items-center mb-6">
+        <h1 className="text-2xl font-bold">Resumes</h1>
+        <Button onClick={create}><PlusIcon className="w-4 h-4 mr-2" />New Resume</Button>
+      </div>
+
+      <div className="grid md:grid-cols-2 gap-6">
+        {items.map(r => (
+          <Card key={r.id} className="bg-white/90 border border-gray-200/60">
+            <CardHeader>
+              <CardTitle className="flex items-center justify-between">
+                <span>{r.title}</span>
+                <Badge variant="secondary">v{r.version}</Badge>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <div className="text-sm text-gray-600 line-clamp-3">{r.summary || "No summary yet."}</div>
+              <div className="flex gap-2">
+                <Button variant="outline" asChild><Link to={`/resumes/${r.id}`}><ExternalLinkIcon className="w-4 h-4 mr-2" />Open</Link></Button>
+                <Button variant="outline" onClick={() => clone(r.id)}><CopyIcon className="w-4 h-4 mr-2" />Clone</Button>
+                <Button onClick={() => exportPdf(r.id)}><FileDownIcon className="w-4 h-4 mr-2" />Export PDF</Button>
+              </div>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+----- /apps/web/src/pages/ResumeEditor.tsx -----
+import React, { useEffect, useMemo, useState } from "react";
+import { useParams } from "react-router-dom";
+import { ResumeEntity } from "@lockedin/shared/entities/resume";
+import type { Resume } from "@lockedin/types/resume";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Badge } from "@/components/ui/badge";
+import { Wand2Icon, SaveIcon, FileDownIcon } from "lucide-react";
+
+export default function ResumeEditorPage() {
+  const { id } = useParams();
+  const [resume, setResume] = useState<Resume | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [tailorInfo, setTailorInfo] = useState<{ fitScore: number; keywordMatches: string[]; missingKeywords: string[]; } | null>(null);
+
+  const load = async () => {
+    if (!id) return;
+    setResume(await ResumeEntity.get(id));
+  };
+
+  useEffect(() => { load(); }, [id]);
+
+  const save = async () => {
+    if (!resume) return;
+    setSaving(true);
+    try {
+      await ResumeEntity.update(resume.id, {
+        title: resume.title,
+        summary: resume.summary,
+        skills: resume.skills,
+        links: resume.links
+      });
+    } finally { setSaving(false); }
+  };
+
+  const exportPdf = async () => {
+    if (!resume) return;
+    const res = await ResumeEntity.export(resume.id);
+    window.open(res.url, "_blank");
+  };
+
+  const tailor = async () => {
+    if (!resume) return;
+    const jobId = prompt("Enter Job ID to tailor toward:");
+    if (!jobId) return;
+    const t = await ResumeEntity.tailor(resume.id, { jobId });
+    setTailorInfo({ fitScore: t.fitScore, keywordMatches: t.keywordMatches, missingKeywords: t.missingKeywords });
+    if (t.suggestions?.reorderedSkills) {
+      setResume({ ...resume, skills: t.suggestions.reorderedSkills });
+    }
+  };
+
+  if (!resume) return <div className="p-6">Loading...</div>;
+
+  return (
+    <div className="p-6 md:p-8 max-w-4xl mx-auto space-y-6">
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold">Edit Resume</h1>
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={tailor}><Wand2Icon className="w-4 h-4 mr-2" />Tailor to Job</Button>
+          <Button variant="outline" onClick={exportPdf}><FileDownIcon className="w-4 h-4 mr-2" />Export</Button>
+          <Button onClick={save} disabled={saving}>
+            {saving ? (<><SaveIcon className="w-4 h-4 mr-2 animate-spin" />Saving...</>) : (<><SaveIcon className="w-4 h-4 mr-2" />Save</>)}
+          </Button>
+        </div>
+      </div>
+
+      <Card className="bg-white/90 border border-gray-200/60">
+        <CardHeader><CardTitle>Basics</CardTitle></CardHeader>
+        <CardContent className="space-y-4">
+          <div>
+            <label className="text-sm font-medium">Title</label>
+            <Input value={resume.title} onChange={(e) => setResume({ ...resume, title: e.target.value })} />
+          </div>
+          <div>
+            <label className="text-sm font-medium">Summary</label>
+            <Textarea rows={4} value={resume.summary || ""} onChange={(e) => setResume({ ...resume, summary: e.target.value })} />
+          </div>
+          <div>
+            <label className="text-sm font-medium">Skills</label>
+            <div className="flex gap-2 mb-2 flex-wrap">
+              {resume.skills.map((s, i) => (
+                <Badge key={i} className="bg-indigo-100 text-indigo-800">
+                  {s}
+                  <button className="ml-2" onClick={() => setResume({ ...resume, skills: resume.skills.filter((x) => x !== s) })}>×</button>
+                </Badge>
+              ))}
+            </div>
+            <Input placeholder="Add skill and press Enter" onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                const v = (e.target as HTMLInputElement).value.trim();
+                if (v && !resume.skills.includes(v)) setResume({ ...resume, skills: [...resume.skills, v] });
+                (e.target as HTMLInputElement).value = "";
+              }
+            }} />
+          </div>
+          <div>
+            <label className="text-sm font-medium">Links</label>
+            <div className="space-y-2">
+              {(resume.links || []).map((l, i) => (
+                <div key={i} className="flex gap-2">
+                  <Input value={l} onChange={(e) => {
+                    const next = [...resume.links];
+                    next[i] = e.target.value;
+                    setResume({ ...resume, links: next });
+                  }} />
+                  <Button variant="outline" onClick={() => setResume({ ...resume, links: (resume.links || []).filter((_, idx) => idx !== i) })}>Remove</Button>
+                </div>
+              ))}
+              <Button variant="outline" onClick={() => setResume({ ...resume, links: [...(resume.links || []), ""] })}>Add Link</Button>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {tailorInfo && (
+        <Card className="bg-indigo-50 border border-indigo-200/60">
+          <CardHeader><CardTitle>Tailoring Insights</CardTitle></CardHeader>
+          <CardContent className="space-y-3">
+            <div className="font-medium">Fit Score: {tailorInfo.fitScore}%</div>
+            <div className="text-sm">
+              <span className="font-semibold">Matches:</span> {tailorInfo.keywordMatches.join(", ") || "—"}
+            </div>
+            <div className="text-sm">
+              <span className="font-semibold">Missing keywords:</span> {tailorInfo.missingKeywords.join(", ") || "—"}
+            </div>
+            <div className="text-xs text-gray-600">Tip: Add missing keywords if they actually describe you; don't keyword-stuff.</div>
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+----- /apps/api/src/seeds/seed-resume.ts -----
+import { PrismaClient } from "@prisma/client";
+const prisma = new PrismaClient();
+
+async function main() {
+  const userId = "demo-user-id"; // align with your auth demo
+
+  const resume = await prisma.resume.create({
+    data: {
+      userId,
+      title: "Software Engineer Intern",
+      summary: "CS student passionate about building accessible web apps and learning fast.",
+      skills: ["typescript", "react", "node", "sql", "python"],
+      links: ["https://github.com/yourname", "https://your-portfolio.example"],
+      experiences: {
+        create: [{
+          company: "Campus Makers Club",
+          role: "Frontend Lead",
+          startDate: new Date("2023-09-01"),
+          highlights: ["Built a component library used by 10+ projects", "Mentored 6 new members"],
+          technologies: ["react", "tailwind", "vite"]
+        }]
+      },
+      educations: {
+        create: [{
+          school: "Riverdale High",
+          degree: "HS Diploma (STEM)",
+          startDate: new Date("2021-09-01"),
+          endDate: new Date("2025-06-01"),
+          highlights: ["Robotics club captain", "AP CS A, AP Calc BC"]
+        }]
+      },
+      projects: {
+        create: [{
+          name: "Meal Planner App",
+          url: "https://example.com",
+          summary: "Generated weekly meal plans and grocery lists.",
+          highlights: ["100+ weekly active users", "PWA offline mode"],
+          technologies: ["react", "workbox", "firebase"]
+        }]
+      }
+    }
+  });
+
+  console.log("Seeded resume:", resume.id);
+}
+
+main().finally(() => prisma.$disconnect());
+
+----- /apps/api/src/modules/index.hint.txt -----
+// Ensure you import these modules in your main API AppModule (or a feature module):
+// import { ResumesModule } from "./modules/resumes/resumes.module";
+// import { DocumentsModule } from "./modules/documents/documents.module";
+// (StorageModule is imported by DocumentsModule)
+
+----- /apps/web/src/router/hint-04.txt -----
+// Add routes into your web app router:
+// <Route path="/resumes" element={<ResumesPage />} />
+// <Route path="/resumes/:id" element={<ResumeEditorPage />} />

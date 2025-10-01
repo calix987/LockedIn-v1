@@ -1,0 +1,1036 @@
+
+LockedIn – Bundle 09 (Connections/Network + Follow/Invite + People Search)
+==========================================================================
+Version: v0.1.0-b09
+Scope: Network graph (connections + follows), invites workflow, people search + suggestions, youth-safety guardrails, REST endpoints, frontend screens and components, analytics events, seed data, tests.
+Tech: NestJS (REST), Prisma (PostgreSQL), TypeScript, React (Vite), shadcn/ui, Tailwind, lucide-react, framer-motion.
+Secrets: None in code. Uses environment variables (prefixed LOCKEDIN_*)
+
+────────────────────────────────────────────────────────────────────────────
+1) Directory Layout (drop these files into your repo)
+────────────────────────────────────────────────────────────────────────────
+/server
+  /src/modules/network
+    network.module.ts
+    network.controller.ts
+    network.service.ts
+    network.guard.ts
+    network.dto.ts
+    network.policy.ts
+    network.safety.ts
+    network.suggestions.ts
+    network.analytics.ts
+    __tests__/network.controller.spec.ts
+  /src/modules/people
+    people.module.ts
+    people.controller.ts
+    people.service.ts
+    people.dto.ts
+    people.search.ts
+    __tests__/people.controller.spec.ts
+/prisma
+  schema.network.prisma.patch
+  seed.network.ts
+/client
+  /src/features/network
+    pages/NetworkPage.tsx
+    components/InviteCard.tsx
+    components/ConnectionCard.tsx
+    components/FollowButton.tsx
+    components/SuggestionCard.tsx
+    api/networkClient.ts
+  /src/features/people
+    pages/PeopleSearchPage.tsx
+    components/PersonCard.tsx
+    api/peopleClient.ts
+  /src/routes/network.tsx
+  /src/routes/people.tsx
+
+────────────────────────────────────────────────────────────────────────────
+2) Prisma schema patch (append to prisma/schema.prisma)
+────────────────────────────────────────────────────────────────────────────
+/prisma/schema.network.prisma.patch
+-----------------------------------
+model User {
+  id               String   @id @default(cuid())
+  // … existing fields
+  ageMode          AgeMode  @default(ADULT) // ADULT | YOUTH
+  safetyPrefs      Json?    // { contactable_by: "anyone|verified_only|connections_only", receive_invites: true }
+  // indices tuned for people search
+  headline         String?  @db.VarChar(140)
+  city             String?
+  country          String?
+  skills           String[] @db.Text[]
+  experienceLevel  ExperienceLevel? // ENTRY | JUNIOR | MID | SENIOR
+  openToWork       Boolean  @default(false)
+  verifiedEmployer Boolean  @default(false) // for company-rep accounts
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  connectionsA Connection[] @relation("A")
+  connectionsB Connection[] @relation("B")
+  followsFrom  Follow[]     @relation("FromUser")
+  followsTo    Follow[]     @relation("ToUser")
+  invitesSent  Invite[]     @relation("Inviter")
+  invitesRecv  Invite[]     @relation("Invitee")
+  blocksFrom   Block[]      @relation("Blocker")
+  blocksTo     Block[]      @relation("Blocked")
+}
+
+enum AgeMode { ADULT YOUTH }
+enum ExperienceLevel { ENTRY JUNIOR MID SENIOR }
+
+model Connection {
+  id        String  @id @default(cuid())
+  aId       String
+  bId       String
+  a         User    @relation("A", fields: [aId], references: [id], onDelete: Cascade)
+  b         User    @relation("B", fields: [bId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  // prevent duplicates (a-b vs b-a)
+  @@unique([aId, bId])
+  @@index([aId])
+  @@index([bId])
+}
+
+model Follow {
+  id        String  @id @default(cuid())
+  fromId    String
+  toId      String
+  from      User    @relation("FromUser", fields: [fromId], references: [id], onDelete: Cascade)
+  to        User    @relation("ToUser", fields: [toId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  @@unique([fromId, toId])
+  @@index([fromId])
+  @@index([toId])
+}
+
+model Invite {
+  id         String   @id @default(cuid())
+  inviterId  String
+  inviteeId  String
+  note       String?  @db.VarChar(280)
+  status     InviteStatus @default(PENDING)
+  createdAt  DateTime @default(now())
+  expiresAt  DateTime
+  inviter    User   @relation("Inviter", fields: [inviterId], references: [id], onDelete: Cascade)
+  invitee    User   @relation("Invitee", fields: [inviteeId], references: [id], onDelete: Cascade)
+  @@index([inviterId])
+  @@index([inviteeId])
+  @@index([status])
+}
+
+enum InviteStatus { PENDING ACCEPTED DECLINED EXPIRED }
+
+model Block {
+  id         String  @id @default(cuid())
+  blockerId  String
+  blockedId  String
+  blocker    User    @relation("Blocker", fields: [blockerId], references: [id], onDelete: Cascade)
+  blocked    User    @relation("Blocked", fields: [blockedId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+  @@unique([blockerId, blockedId])
+  @@index([blockerId])
+  @@index([blockedId])
+}
+
+/// Optional: simple search index table (denormalized) for fast people search
+model PeopleIndex {
+  userId        String @id
+  name          String
+  headline      String?
+  city          String?
+  country       String?
+  skills        String
+  experience    ExperienceLevel?
+  openToWork    Boolean
+  verifiedEmployer Boolean
+  ageMode       AgeMode
+  updatedAt     DateTime @updatedAt
+  @@index([country, city])
+  @@index([experience])
+  @@index([openToWork])
+  @@index([ageMode])
+  @@index([verifiedEmployer])
+}
+
+────────────────────────────────────────────────────────────────────────────
+3) ENV variables (add to .env – values are placeholders)
+────────────────────────────────────────────────────────────────────────────
+LOCKEDIN_INVITE_TTL_DAYS=30
+LOCKEDIN_NETWORK_PAGE_SIZE=20
+LOCKEDIN_SUGGESTIONS_LIMIT=20
+LOCKEDIN_PEOPLE_MAX_QUERY_LEN=80
+LOCKEDIN_MIN_AGE_CONTACT_GUARD=18
+
+────────────────────────────────────────────────────────────────────────────
+4) NestJS Module – Network (server/src/modules/network/*)
+────────────────────────────────────────────────────────────────────────────
+network.module.ts
+-----------------
+import { Module } from '@nestjs/common';
+import { PrismaService } from '@/core/prisma.service';
+import { NetworkController } from './network.controller';
+import { NetworkService } from './network.service';
+import { NetworkGuard } from './network.guard';
+import { NetworkPolicy } from './network.policy';
+import { NetworkSafety } from './network.safety';
+import { NetworkSuggestions } from './network.suggestions';
+import { NetworkAnalytics } from './network.analytics';
+
+@Module({
+  controllers: [NetworkController],
+  providers: [
+    PrismaService,
+    NetworkService,
+    NetworkGuard,
+    NetworkPolicy,
+    NetworkSafety,
+    NetworkSuggestions,
+    NetworkAnalytics,
+  ],
+  exports: [NetworkService],
+})
+export class NetworkModule {}
+
+network.dto.ts
+--------------
+import { IsString, IsOptional, MaxLength, IsIn } from 'class-validator';
+
+export class InviteDto {
+  @IsString() inviteeId: string;
+  @IsOptional() @IsString() @MaxLength(280) note?: string;
+}
+
+export class RespondInviteDto {
+  @IsString() inviteId: string;
+  @IsIn(['ACCEPTED', 'DECLINED']) decision: 'ACCEPTED' | 'DECLINED';
+}
+
+export class FollowDto {
+  @IsString() targetId: string;
+}
+
+export class QueryDto {
+  @IsOptional() cursor?: string;
+  @IsOptional() q?: string;
+}
+
+network.policy.ts
+-----------------
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class NetworkPolicy {
+  canFollow(currentUser, target) {
+    if (!target) return false;
+    if (currentUser.id === target.id) return false;
+    return true;
+  }
+
+  canInvite(currentUser, target) {
+    if (!target) return false;
+    if (currentUser.id === target.id) return false;
+    // Youth protection: if target is YOUTH and prefers verified_only, require inviter.verifiedEmployer
+    if (target.ageMode === 'YOUTH') {
+      const pref = target.safetyPrefs?.contactable_by ?? 'verified_only';
+      if (pref === 'verified_only' && !currentUser.verifiedEmployer) return false;
+      if (pref === 'connections_only') return false; // cannot invite directly
+    }
+    return true;
+  }
+
+  canSeeConnections(viewer, owner) {
+    if (owner.ageMode === 'YOUTH') {
+      // Allow only mutual connections or verified employers to see full list
+      if (viewer?.verifiedEmployer) return true;
+      if (!viewer) return false;
+      return viewer.id === owner.id;
+    }
+    return true;
+  }
+}
+
+network.safety.ts
+-----------------
+import { Injectable, ForbiddenException } from '@nestjs/common';
+
+@Injectable()
+export class NetworkSafety {
+  enforceYouthNoMeetups(note?: string) {
+    if (!note) return;
+    const blockedPhrases = [/meet\s?up/i, /in-?person/i, /come to/i, /address/i];
+    if (blockedPhrases.some(rx => rx.test(note))) {
+      throw new ForbiddenException('Notes must not suggest in‑person meetings.');
+    }
+  }
+}
+
+network.suggestions.ts
+----------------------
+import { Injectable } from '@nestjs/common';
+import { PrismaClient } from '@prisma/client';
+
+@Injectable()
+export class NetworkSuggestions {
+  constructor(private prisma: PrismaClient) {}
+
+  async suggestionsFor(userId: string, limit: number) {
+    // Heuristics: shared skills, same city/country, 2nd-degree connections, verified employers if user is YOUTH
+    const user = await this.prisma.user.findUnique({ where: { id: userId }});
+    const skillOverlapWeight = 3, locationWeight = 2, degree2Weight = 1;
+
+    // naive scoring using PeopleIndex to avoid heavy joins
+    const idx = await this.prisma.peopleIndex.findMany({ take: 500 });
+    const mySkills = new Set(user?.skills ?? []);
+
+    const scoreRow = (row) => {
+      if (row.userId === userId) return -1;
+      let s = 0;
+      if (row.country === user?.country) s += locationWeight;
+      if (row.city && row.city === user?.city) s += locationWeight;
+      const skills = (row.skills ?? '').split('|').filter(Boolean);
+      const overlap = skills.filter(sk => mySkills.has(sk)).length;
+      s += overlap * skillOverlapWeight;
+      // prefer verified employers for youth
+      if (user?.ageMode === 'YOUTH' && row.verifiedEmployer) s += 5;
+      return s;
+    };
+
+    const ranked = idx
+      .map(r => ({ r, score: scoreRow(r) }))
+      .filter(x => x.score > 0)
+      .sort((a,b) => b.score - a.score)
+      .slice(0, limit)
+      .map(x => x.r.userId);
+
+    return this.prisma.user.findMany({
+      where: { id: { in: ranked } },
+      select: { id: true, fullName: true, headline: true, city: true, country: true, skills: true, verifiedEmployer: true, ageMode: true },
+    });
+  }
+}
+
+network.analytics.ts
+--------------------
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class NetworkAnalytics {
+  track(event: string, payload: Record<string, any>) {
+    // no-op placeholder — wire to your analytics later
+    // console.log('[analytics]', event, payload);
+  }
+}
+
+network.guard.ts
+----------------
+import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
+
+@Injectable()
+export class NetworkGuard implements CanActivate {
+  canActivate(ctx: ExecutionContext): boolean {
+    const req = ctx.switchToHttp().getRequest();
+    // Basic auth presence check (actual auth middleware should already inject req.user)
+    return !!req.user;
+  }
+}
+
+network.service.ts
+------------------
+import { Injectable, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { PrismaService } from '@/core/prisma.service';
+import { addDays, isBefore } from 'date-fns';
+
+const INVITE_TTL_DAYS = parseInt(process.env.LOCKEDIN_INVITE_TTL_DAYS ?? '30', 10);
+const PAGE_SIZE = parseInt(process.env.LOCKEDIN_NETWORK_PAGE_SIZE ?? '20', 10);
+
+@Injectable()
+export class NetworkService {
+  constructor(private prisma: PrismaService) {}
+
+  async sendInvite(inviterId: string, inviteeId: string, note?: string) {
+    if (inviterId === inviteeId) throw new BadRequestException('Cannot invite yourself.');
+
+    // Cannot duplicate if existing connection or pending invite
+    const exists = await this.prisma.connection.findFirst({
+      where: { OR: [{ aId: inviterId, bId: inviteeId }, { aId: inviteeId, bId: inviterId }] }
+    });
+    if (exists) throw new BadRequestException('Already connected.');
+
+    const pending = await this.prisma.invite.findFirst({
+      where: {
+        inviterId, inviteeId, status: 'PENDING'
+      }
+    });
+    if (pending) throw new BadRequestException('Invite already pending.');
+
+    const expiresAt = addDays(new Date(), INVITE_TTL_DAYS);
+    return this.prisma.invite.create({
+      data: { inviterId, inviteeId, note, expiresAt }
+    });
+  }
+
+  async respondInvite(currentUserId: string, inviteId: string, decision: 'ACCEPTED'|'DECLINED') {
+    const inv = await this.prisma.invite.findUnique({ where: { id: inviteId }});
+    if (!inv) throw new NotFoundException('Invite not found.');
+    if (inv.inviteeId !== currentUserId) throw new ForbiddenException('Not your invite.');
+    if (inv.status !== 'PENDING') throw new BadRequestException('Invite no longer pending.');
+    if (isBefore(inv.expiresAt, new Date())) {
+      await this.prisma.invite.update({ where: { id: inv.id }, data: { status: 'EXPIRED' } });
+      throw new BadRequestException('Invite expired.');
+    }
+
+    if (decision === 'DECLINED') {
+      return this.prisma.invite.update({ where: { id: inv.id }, data: { status: 'DECLINED' } });
+    }
+
+    // ACCEPTED → create connection (aId < bId order)
+    const [aId, bId] = inv.inviterId < inv.inviteeId ? [inv.inviterId, inv.inviteeId] : [inv.inviteeId, inv.inviterId];
+    await this.prisma.connection.create({ data: { aId, bId } });
+    return this.prisma.invite.update({ where: { id: inv.id }, data: { status: 'ACCEPTED' } });
+  }
+
+  async removeConnection(currentUserId: string, otherUserId: string) {
+    const con = await this.prisma.connection.findFirst({
+      where: { OR: [{ aId: currentUserId, bId: otherUserId }, { aId: otherUserId, bId: currentUserId }] }
+    });
+    if (!con) throw new NotFoundException('Not connected.');
+    await this.prisma.connection.delete({ where: { id: con.id } });
+    return { ok: true };
+  }
+
+  async listConnections(userId: string, cursor?: string) {
+    return this.prisma.connection.findMany({
+      where: { OR: [{ aId: userId }, { bId: userId }] },
+      take: PAGE_SIZE,
+      skip: cursor ? 1 : 0,
+      cursor: cursor ? { id: cursor } : undefined,
+      orderBy: { createdAt: 'desc' }
+    });
+  }
+
+  async follow(fromId: string, toId: string) {
+    if (fromId === toId) throw new BadRequestException('Cannot follow yourself.');
+    return this.prisma.follow.upsert({
+      where: { fromId_toId: { fromId, toId } },
+      create: { fromId, toId },
+      update: {}
+    });
+  }
+
+  async unfollow(fromId: string, toId: string) {
+    await this.prisma.follow.delete({ where: { fromId_toId: { fromId, toId } } }).catch(()=>{});
+    return { ok: true };
+  }
+
+  async incomingInvites(userId: string) {
+    return this.prisma.invite.findMany({ where: { inviteeId: userId, status: 'PENDING' }, orderBy: { createdAt: 'desc' } });
+  }
+
+  async outgoingInvites(userId: string) {
+    return this.prisma.invite.findMany({ where: { inviterId: userId, status: 'PENDING' }, orderBy: { createdAt: 'desc' } });
+  }
+}
+
+network.controller.ts
+---------------------
+import { Controller, Get, Post, Delete, Body, Param, Query, UseGuards, Req, ForbiddenException } from '@nestjs/common';
+import { NetworkService } from './network.service';
+import { NetworkGuard } from './network.guard';
+import { InviteDto, RespondInviteDto, FollowDto, QueryDto } from './network.dto';
+import { NetworkPolicy } from './network.policy';
+import { NetworkSafety } from './network.safety';
+import { NetworkSuggestions } from './network.suggestions';
+import { NetworkAnalytics } from './network.analytics';
+
+@UseGuards(NetworkGuard)
+@Controller('network')
+export class NetworkController {
+  constructor(
+    private svc: NetworkService,
+    private policy: NetworkPolicy,
+    private safety: NetworkSafety,
+    private suggestions: NetworkSuggestions,
+    private analytics: NetworkAnalytics,
+  ) {}
+
+  @Post('invite')
+  async invite(@Req() req, @Body() body: InviteDto) {
+    const current = req.user;
+    const target = await req.prisma.user.findUnique({ where: { id: body.inviteeId }});
+    if (!this.policy.canInvite(current, target)) throw new ForbiddenException('Cannot invite this user.');
+    this.safety.enforceYouthNoMeetups(body.note);
+    const inv = await this.svc.sendInvite(current.id, body.inviteeId, body.note);
+    this.analytics.track('invite_sent', { from: current.id, to: body.inviteeId });
+    return inv;
+  }
+
+  @Post('respond')
+  async respond(@Req() req, @Body() body: RespondInviteDto) {
+    const current = req.user;
+    const out = await this.svc.respondInvite(current.id, body.inviteId, body.decision);
+    this.analytics.track('invite_responded', { user: current.id, invite: body.inviteId, decision: body.decision });
+    return out;
+  }
+
+  @Delete('connection/:otherId')
+  async remove(@Req() req, @Param('otherId') otherId: string) {
+    const current = req.user;
+    const out = await this.svc.removeConnection(current.id, otherId);
+    this.analytics.track('connection_removed', { a: current.id, b: otherId });
+    return out;
+  }
+
+  @Get('connections')
+  async listConnections(@Req() req, @Query() q: QueryDto) {
+    const current = req.user;
+    const ownerId = q.q /* optional userId */ || current.id;
+    const owner = await req.prisma.user.findUnique({ where: { id: ownerId }});
+    if (!owner) return [];
+    if (!this.policy.canSeeConnections(current, owner)) throw new ForbiddenException('Restricted.');
+    return this.svc.listConnections(ownerId, q.cursor);
+  }
+
+  @Post('follow')
+  async follow(@Req() req, @Body() body: FollowDto) {
+    const current = req.user;
+    const target = await req.prisma.user.findUnique({ where: { id: body.targetId }});
+    if (!this.policy.canFollow(current, target)) throw new ForbiddenException('Cannot follow.');
+    const res = await this.svc.follow(current.id, body.targetId);
+    this.analytics.track('follow', { from: current.id, to: body.targetId });
+    return res;
+  }
+
+  @Delete('follow/:targetId')
+  async unfollow(@Req() req, @Param('targetId') targetId: string) {
+    const current = req.user;
+    const res = await this.svc.unfollow(current.id, targetId);
+    this.analytics.track('unfollow', { from: current.id, to: targetId });
+    return res;
+  }
+
+  @Get('invites/incoming')
+  async incoming(@Req() req) {
+    return this.svc.incomingInvites(req.user.id);
+  }
+
+  @Get('invites/outgoing')
+  async outgoing(@Req() req) {
+    return this.svc.outgoingInvites(req.user.id);
+  }
+
+  @Get('suggestions')
+  async suggestionsRoute(@Req() req) {
+    const limit = parseInt(process.env.LOCKEDIN_SUGGESTIONS_LIMIT ?? '20', 10);
+    return this.suggestions.suggestionsFor(req.user.id, limit);
+  }
+}
+
+────────────────────────────────────────────────────────────────────────────
+5) NestJS Module – People (search + profiles)
+────────────────────────────────────────────────────────────────────────────
+people.module.ts
+----------------
+import { Module } from '@nestjs/common';
+import { PrismaService } from '@/core/prisma.service';
+import { PeopleController } from './people.controller';
+import { PeopleService } from './people.service';
+
+@Module({
+  controllers: [PeopleController],
+  providers: [PrismaService, PeopleService],
+})
+export class PeopleModule {}
+
+people.dto.ts
+-------------
+import { IsOptional, IsString, MaxLength, IsEnum, IsBoolean } from 'class-validator';
+
+export class PeopleQueryDto {
+  @IsOptional() @IsString() @MaxLength(parseInt(process.env.LOCKEDIN_PEOPLE_MAX_QUERY_LEN ?? '80', 10)) q?: string;
+  @IsOptional() @IsString() country?: string;
+  @IsOptional() @IsString() city?: string;
+  @IsOptional() @IsString() skill?: string;
+  @IsOptional() @IsString() experience?: 'ENTRY' | 'JUNIOR' | 'MID' | 'SENIOR';
+  @IsOptional() @IsBoolean() openToWork?: boolean;
+  @IsOptional() @IsString() mode?: 'ADULT' | 'YOUTH';
+}
+
+people.search.ts
+----------------
+export function buildPeopleWhere(q: any) {
+  const where: any = {};
+  if (q.country) where.country = q.country;
+  if (q.city) where.city = q.city;
+  if (q.experience) where.experience = q.experience;
+  if (q.openToWork !== undefined) where.openToWork = q.openToWork;
+  if (q.mode) where.ageMode = q.mode;
+
+  // text/skill query
+  if (q.q) {
+    where.OR = [
+      { name: { contains: q.q, mode: 'insensitive' } },
+      { headline: { contains: q.q, mode: 'insensitive' } },
+      { skills: { has: q.q } },
+    ];
+  }
+  if (q.skill) {
+    where.skills = { has: q.skill };
+  }
+  return where;
+}
+
+people.service.ts
+-----------------
+import { Injectable } from '@nestjs/common';
+import { PrismaService } from '@/core/prisma.service';
+import { buildPeopleWhere } from './people.search';
+
+const PAGE_SIZE = 20;
+
+@Injectable()
+export class PeopleService {
+  constructor(private prisma: PrismaService) {}
+
+  async search(q: any, cursor?: string) {
+    const where = buildPeopleWhere(q);
+    return this.prisma.user.findMany({
+      where,
+      select: { id: true, fullName: true, headline: true, city: true, country: true, skills: true, experienceLevel: true, openToWork: true, verifiedEmployer: true, ageMode: true },
+      take: PAGE_SIZE,
+      skip: cursor ? 1 : 0,
+      cursor: cursor ? { id: cursor } : undefined,
+      orderBy: { createdAt: 'desc' }
+    });
+  }
+}
+
+people.controller.ts
+--------------------
+import { Controller, Get, Query } from '@nestjs/common';
+import { PeopleService } from './people.service';
+import { PeopleQueryDto } from './people.dto';
+
+@Controller('people')
+export class PeopleController {
+  constructor(private svc: PeopleService) {}
+
+  @Get('search')
+  async search(@Query() q: PeopleQueryDto & { cursor?: string }) {
+    return this.svc.search(q, q.cursor);
+  }
+}
+
+────────────────────────────────────────────────────────────────────────────
+6) Seed data (append to prisma/seed.ts or run separately)
+────────────────────────────────────────────────────────────────────────────
+/prisma/seed.network.ts
+-----------------------
+import { PrismaClient } from '@prisma/client';
+const prisma = new PrismaClient();
+
+async function main() {
+  const users = await prisma.user.findMany({ take: 10 });
+  if (users.length < 2) return;
+
+  // create a few follows and invites
+  await prisma.follow.create({ data: { fromId: users[0].id, toId: users[1].id }}).catch(()=>{});
+  await prisma.invite.create({
+    data: {
+      inviterId: users[1].id,
+      inviteeId: users[0].id,
+      note: 'Hey! Loved your portfolio — would love to connect.',
+      expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 24 * 30)
+    }
+  }).catch(()=>{});
+
+  // simple PeopleIndex refresh
+  const all = await prisma.user.findMany();
+  for (const u of all) {
+    await prisma.peopleIndex.upsert({
+      where: { userId: u.id },
+      create: {
+        userId: u.id,
+        name: u.fullName ?? 'User',
+        headline: u.headline ?? null,
+        city: u.city ?? null,
+        country: u.country ?? null,
+        skills: (u.skills ?? []).join('|'),
+        experience: u.experienceLevel ?? null,
+        openToWork: !!u.openToWork,
+        verifiedEmployer: !!u.verifiedEmployer,
+        ageMode: u.ageMode,
+      },
+      update: {
+        name: u.fullName ?? 'User',
+        headline: u.headline ?? null,
+        city: u.city ?? null,
+        country: u.country ?? null,
+        skills: (u.skills ?? []).join('|'),
+        experience: u.experienceLevel ?? null,
+        openToWork: !!u.openToWork,
+        verifiedEmployer: !!u.verifiedEmployer,
+        ageMode: u.ageMode,
+      }
+    });
+  }
+}
+
+main().finally(() => prisma.$disconnect());
+
+────────────────────────────────────────────────────────────────────────────
+7) Frontend – API clients
+────────────────────────────────────────────────────────────────────────────
+/client/src/features/network/api/networkClient.ts
+--------------------------------------------------
+import { api } from '@/lib/api';
+
+export const NetworkAPI = {
+  invite: (inviteeId: string, note?: string) => api.post('/network/invite', { inviteeId, note }),
+  respondInvite: (inviteId: string, decision: 'ACCEPTED'|'DECLINED') => api.post('/network/respond', { inviteId, decision }),
+  removeConnection: (otherId: string) => api.delete(`/network/connection/${otherId}`),
+  follow: (targetId: string) => api.post('/network/follow', { targetId }),
+  unfollow: (targetId: string) => api.delete(`/network/follow/${targetId}`),
+  connections: (userId?: string, cursor?: string) => api.get('/network/connections', { params: { q: userId, cursor } }),
+  invitesIncoming: () => api.get('/network/invites/incoming'),
+  invitesOutgoing: () => api.get('/network/invites/outgoing'),
+  suggestions: () => api.get('/network/suggestions'),
+};
+
+/client/src/features/people/api/peopleClient.ts
+-----------------------------------------------
+import { api } from '@/lib/api';
+export const PeopleAPI = {
+  search: (params: any) => api.get('/people/search', { params }),
+};
+
+────────────────────────────────────────────────────────────────────────────
+8) Frontend – Components & Pages
+────────────────────────────────────────────────────────────────────────────
+/client/src/features/network/components/FollowButton.tsx
+--------------------------------------------------------
+import React, { useState } from 'react';
+import { NetworkAPI } from '../api/networkClient';
+import { Button } from '@/components/ui/button';
+
+export function FollowButton({ userId, initialFollowing = false }) {
+  const [following, setFollowing] = useState(initialFollowing);
+  const [loading, setLoading] = useState(false);
+  const toggle = async () => {
+    setLoading(true);
+    try {
+      if (following) { await NetworkAPI.unfollow(userId); } else { await NetworkAPI.follow(userId); }
+      setFollowing(!following);
+    } finally { setLoading(false); }
+  };
+  return (
+    <Button onClick={toggle} disabled={loading} variant={following ? 'outline' : 'default'}>
+      {loading ? '…' : (following ? 'Following' : 'Follow')}
+    </Button>
+  );
+}
+
+/client/src/features/network/components/InviteCard.tsx
+------------------------------------------------------
+import React from 'react';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { NetworkAPI } from '../api/networkClient';
+
+export function InviteCard({ invite }) {
+  const respond = (d: 'ACCEPTED'|'DECLINED') => NetworkAPI.respondInvite(invite.id, d);
+  return (
+    <Card className="bg-white/90 border border-gray-200/60">
+      <CardHeader><CardTitle>{invite.inviter.fullName}</CardTitle></CardHeader>
+      <CardContent>
+        <p className="text-sm text-gray-600 mb-3">{invite.note || 'No note'}</p>
+        <div className="flex gap-2">
+          <Button onClick={() => respond('ACCEPTED')}>Accept</Button>
+          <Button variant="outline" onClick={() => respond('DECLINED')}>Decline</Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/client/src/features/network/components/ConnectionCard.tsx
+----------------------------------------------------------
+import React from 'react';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { NetworkAPI } from '../api/networkClient';
+
+export function ConnectionCard({ user, onRemove }) {
+  return (
+    <Card className="bg-white/90 border border-gray-200/60">
+      <CardHeader><CardTitle>{user.fullName}</CardTitle></CardHeader>
+      <CardContent className="flex items-center justify-between">
+        <p className="text-sm text-gray-600">{user.headline}</p>
+        <Button variant="outline" onClick={() => onRemove?.(user.id)}>Remove</Button>
+      </CardContent>
+    </Card>
+  );
+}
+
+/client/src/features/network/components/SuggestionCard.tsx
+----------------------------------------------------------
+import React from 'react';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { NetworkAPI } from '../api/networkClient';
+
+export function SuggestionCard({ user }) {
+  const connect = async () => {
+    await NetworkAPI.invite(user.id, 'Let’s connect!');
+    alert('Invite sent.');
+  };
+  return (
+    <Card className="bg-white/90 border border-gray-200/60 hover:shadow">
+      <CardHeader><CardTitle>{user.fullName}</CardTitle></CardHeader>
+      <CardContent className="flex items-center justify-between">
+        <p className="text-sm text-gray-600">{user.headline}</p>
+        <div className="flex gap-2">
+          <Button onClick={connect}>Connect</Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/client/src/features/network/pages/NetworkPage.tsx
+--------------------------------------------------
+import React, { useEffect, useState } from 'react';
+import { NetworkAPI } from '../api/networkClient';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { SuggestionCard } from '../components/SuggestionCard';
+import { ConnectionCard } from '../components/ConnectionCard';
+import { InviteCard } from '../components/InviteCard';
+
+export default function NetworkPage() {
+  const [suggestions, setSuggestions] = useState([]);
+  const [connections, setConnections] = useState([]);
+  const [incoming, setIncoming] = useState([]);
+  const [outgoing, setOutgoing] = useState([]);
+
+  const load = async () => {
+    const [sug, conns, inc, out] = await Promise.all([
+      NetworkAPI.suggestions().then(r=>r.data),
+      NetworkAPI.connections().then(r=>r.data),
+      NetworkAPI.invitesIncoming().then(r=>r.data),
+      NetworkAPI.invitesOutgoing().then(r=>r.data),
+    ]);
+    setSuggestions(sug);
+    // map connections into users (server returns pairs; adapt as needed)
+    const userIds = new Set();
+    conns.forEach(c => { userIds.add(c.aId); userIds.add(c.bId); });
+    setConnections([...userIds].map(id => ({ id, fullName: `User ${id.slice(0,4)}`, headline: 'Connection'})));
+    setIncoming(inc);
+    setOutgoing(out);
+  };
+
+  useEffect(()=>{ load(); }, []);
+
+  return (
+    <div className="max-w-6xl mx-auto p-6 space-y-8">
+      <section>
+        <h2 className="text-2xl font-bold mb-3">Suggestions</h2>
+        <div className="grid md:grid-cols-2 gap-4">
+          {suggestions.map(u => <SuggestionCard key={u.id} user={u} />)}
+        </div>
+      </section>
+
+      <section>
+        <h2 className="text-2xl font-bold mb-3">Invites</h2>
+        <div className="grid md:grid-cols-2 gap-4">
+          {incoming.map(inv => <InviteCard key={inv.id} invite={inv} />)}
+          {outgoing.map(inv => (
+            <Card key={inv.id}><CardHeader><CardTitle>Pending to {inv.inviteeId}</CardTitle></CardHeader><CardContent>Sent {new Date(inv.createdAt).toLocaleDateString()}</CardContent></Card>
+          ))}
+        </div>
+      </section>
+
+      <section>
+        <h2 className="text-2xl font-bold mb-3">Connections</h2>
+        <div className="grid md:grid-cols-2 gap-4">
+          {connections.map(u => <ConnectionCard key={u.id} user={u} />)}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+/client/src/features/people/components/PersonCard.tsx
+-----------------------------------------------------
+import React from 'react';
+import { FollowButton } from '@/features/network/components/FollowButton';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+
+export function PersonCard({ person }) {
+  return (
+    <Card className="bg-white/90 border border-gray-200/60">
+      <CardHeader>
+        <CardTitle>{person.fullName}</CardTitle>
+      </CardHeader>
+      <CardContent className="flex items-center justify-between">
+        <div>
+          <p className="text-sm text-gray-600">{person.headline}</p>
+          <p className="text-xs text-gray-500">{[person.city, person.country].filter(Boolean).join(', ')}</p>
+          <div className="flex flex-wrap gap-1 mt-2">
+            {(person.skills ?? []).slice(0,5).map((s: string) => (
+              <span key={s} className="text-xs bg-gray-100 px-2 py-0.5 rounded">{s}</span>
+            ))}
+          </div>
+        </div>
+        <FollowButton userId={person.id} />
+      </CardContent>
+    </Card>
+  );
+}
+
+/client/src/features/people/pages/PeopleSearchPage.tsx
+------------------------------------------------------
+import React, { useEffect, useState } from 'react';
+import { PeopleAPI } from '../api/peopleClient';
+import { Input } from '@/components/ui/input';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { PersonCard } from '../components/PersonCard';
+
+export default function PeopleSearchPage() {
+  const [q, setQ] = useState('');
+  const [filters, setFilters] = useState({ country: '', city: '', experience: '', openToWork: '', mode: '' });
+  const [results, setResults] = useState([]);
+
+  const search = async () => {
+    const params: any = { q };
+    Object.entries(filters).forEach(([k,v]) => { if (v) params[k] = v; });
+    const res = await PeopleAPI.search(params);
+    setResults(res.data);
+  };
+
+  useEffect(()=>{ search(); }, []);
+
+  return (
+    <div className="max-w-6xl mx-auto p-6 space-y-6">
+      <div className="grid md:grid-cols-5 gap-3">
+        <Input placeholder="Search people, skills, headlines…" value={q} onChange={e=>setQ(e.target.value)} className="md:col-span-2" />
+        <Input placeholder="Country" value={filters.country} onChange={e=>setFilters({...filters, country:e.target.value})} />
+        <Input placeholder="City" value={filters.city} onChange={e=>setFilters({...filters, city:e.target.value})} />
+        <Select onValueChange={v=>setFilters({...filters, experience:v})}>
+          <SelectTrigger><SelectValue placeholder="Experience" /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="ENTRY">Entry</SelectItem>
+            <SelectItem value="JUNIOR">Junior</SelectItem>
+            <SelectItem value="MID">Mid</SelectItem>
+            <SelectItem value="SENIOR">Senior</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+      <div className="flex gap-2">
+        <button className="px-4 py-2 rounded bg-indigo-600 text-white" onClick={search}>Search</button>
+        <button className="px-4 py-2 rounded border" onClick={()=>{ setQ(''); setFilters({ country:'', city:'', experience:'', openToWork:'', mode:''}); search();}}>Clear</button>
+      </div>
+
+      <div className="grid md:grid-cols-2 gap-4">
+        {results.map((p:any) => <PersonCard key={p.id} person={p} />)}
+      </div>
+    </div>
+  );
+}
+
+────────────────────────────────────────────────────────────────────────────
+9) Routes (client/src/routes/*.tsx) — register pages
+────────────────────────────────────────────────────────────────────────────
+/client/src/routes/network.tsx
+------------------------------
+import React from 'react';
+import NetworkPage from '@/features/network/pages/NetworkPage';
+export default function RouteNetwork() { return <NetworkPage />; }
+
+/client/src/routes/people.tsx
+-----------------------------
+import React from 'react';
+import PeopleSearchPage from '@/features/people/pages/PeopleSearchPage';
+export default function RoutePeople() { return <PeopleSearchPage />; }
+
+────────────────────────────────────────────────────────────────────────────
+10) Tests (light scaffolding)
+────────────────────────────────────────────────────────────────────────────
+/server/src/modules/network/__tests__/network.controller.spec.ts
+----------------------------------------------------------------
+import { Test } from '@nestjs/testing';
+import { NetworkController } from '../network.controller';
+import { NetworkService } from '../network.service';
+
+describe('NetworkController', () => {
+  it('should be defined', async () => {
+    const module = await Test.createTestingModule({
+      controllers: [NetworkController],
+      providers: [{ provide: NetworkService, useValue: {} }],
+    }).compile();
+    const controller = module.get(NetworkController);
+    expect(controller).toBeDefined();
+  });
+});
+
+/server/src/modules/people/__tests__/people.controller.spec.ts
+--------------------------------------------------------------
+import { Test } from '@nestjs/testing';
+import { PeopleController } from '../people.controller';
+import { PeopleService } from '../people.service';
+
+describe('PeopleController', () => {
+  it('should be defined', async () => {
+    const module = await Test.createTestingModule({
+      controllers: [PeopleController],
+      providers: [{ provide: PeopleService, useValue: {} }],
+    }).compile();
+    const controller = module.get(PeopleController);
+    expect(controller).toBeDefined();
+  });
+});
+
+────────────────────────────────────────────────────────────────────────────
+11) Wiring & Migration
+────────────────────────────────────────────────────────────────────────────
+1. Append prisma/schema.network.prisma.patch to prisma/schema.prisma
+2. npx prisma generate
+3. npx prisma migrate dev -n "network_and_people"
+4. Seed (optional): ts-node prisma/seed.network.ts
+5. Register modules in server/src/app.module.ts:
+   import { NetworkModule } from './modules/network/network.module';
+   import { PeopleModule } from './modules/people/people.module';
+   @Module({ imports: [NetworkModule, PeopleModule, …] })
+6. Ensure auth middleware sets req.user and req.prisma (if you follow this pattern). Otherwise, replace with injected PrismaService calls in controller.
+7. Client: add routes into your router (e.g., /network, /people).
+
+────────────────────────────────────────────────────────────────────────────
+12) Youth-Safety Defaults (important)
+────────────────────────────────────────────────────────────────────────────
+- Users with ageMode=YOUTH:
+  - safetyPrefs.contactable_by defaults to "verified_only".
+  - NetworkPolicy prevents direct invites from non-verified employers.
+  - Notes filtered to block in‑person meetups suggestions.
+  - Connection list visibility limited (owner or verified employer).
+- Do not add meet-up scheduling in network flows.
+
+────────────────────────────────────────────────────────────────────────────
+13) Analytics Events (stubs)
+────────────────────────────────────────────────────────────────────────────
+invite_sent, invite_responded(decision), connection_removed, follow, unfollow, people_search(query, filters)
+
+────────────────────────────────────────────────────────────────────────────
+14) Future Enhancements (not in this bundle)
+────────────────────────────────────────────────────────────────────────────
+- 2nd-degree “People you may know” using graph traversal.
+- Mutual skills count badges.
+- Endorsements & recommendations (with moderation queue for youth).
+- Rate limiting & abuse prevention endpoints (report/block UI).
+- Elastic/Lucene search for people with vector skills.
+
+────────────────────────────────────────────────────────────────────────────
+15) Notes
+────────────────────────────────────────────────────────────────────────────
+- This bundle assumes auth + base server scaffolding exist (as in earlier bundles).
+- All code avoids secrets and uses environment variables only.
+- Some client mapping of connections to user profiles is stubbed (replace with server join).

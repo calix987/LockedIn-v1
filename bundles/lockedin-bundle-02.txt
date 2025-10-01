@@ -1,0 +1,1217 @@
+LOCKEDIN — BUNDLE 02 (Profiles + Social Graph + People Search)
+Version: v0.2.0
+Bundle type: additive (drop-in), no secrets included
+Target stacks: 
+- API: NestJS + Prisma (apps/api)
+- Web: React + Vite + Tailwind + shadcn/ui + lucide-react + framer-motion (apps/web)
+- Shared: packages/contracts, packages/sdk
+Notes:
+- This bundle assumes Bundle 01 (Auth + Accounts) is present.
+- All paths are relative to repo root.
+- Create files exactly as delimited by markers below.
+- If a file already exists, replace it with this version unless your local changes are intentional.
+- Prisma: we ship a migration SQL (safe), plus a schema partial you can merge into prisma/schema.prisma.
+- Youth Safety: enforced at API endpoints (minors’ privacy defaults + strict connection rules).
+
+──────────────────────────────────────────────────────────────────────────────
+
+----- /apps/api/src/modules/profile/profile.module.ts -----
+import { Module } from '@nestjs/common';
+import { ProfileService } from './profile.service';
+import { ProfileController } from './profile.controller';
+import { PrismaService } from '../../prisma/prisma.service';
+
+@Module({
+  controllers: [ProfileController],
+  providers: [ProfileService, PrismaService],
+  exports: [ProfileService],
+})
+export class ProfileModule {}
+
+----- /apps/api/src/modules/profile/profile.controller.ts -----
+import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  Patch,
+  Query,
+  UseGuards,
+} from '@nestjs/common';
+import { ProfileService } from './profile.service';
+import { UpdateProfileDto } from './types/update-profile.dto';
+import { JwtAuthGuard } from '../../auth/guards/jwt.guard';
+import { CurrentUser } from '../../shared/decorators/current-user.decorator';
+import { SearchPeopleQueryDto } from './types/search-people.dto';
+
+@Controller('profile')
+export class ProfileController {
+  constructor(private readonly profile: ProfileService) {}
+
+  @UseGuards(JwtAuthGuard)
+  @Get('me')
+  async me(@CurrentUser() user: any) {
+    return this.profile.getProfileByUserId(user.id);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Patch('me')
+  async updateMe(@CurrentUser() user: any, @Body() dto: UpdateProfileDto) {
+    return this.profile.updateProfile(user.id, dto);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Get(':userId')
+  async getPublicProfile(
+    @CurrentUser() viewer: any,
+    @Param('userId') userId: string,
+  ) {
+    return this.profile.getPublicProfile(viewer?.id, userId);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Get()
+  async search(@Query() query: SearchPeopleQueryDto, @CurrentUser() user: any) {
+    return this.profile.searchPeople(user.id, query);
+  }
+}
+
+----- /apps/api/src/modules/profile/profile.service.ts -----
+import { Injectable, ForbiddenException } from '@nestjs/common';
+import { PrismaService } from '../../prisma/prisma.service';
+import { UpdateProfileDto } from './types/update-profile.dto';
+import { SearchPeopleQueryDto } from './types/search-people.dto';
+
+@Injectable()
+export class ProfileService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async ensureProfile(userId: string) {
+    const existing = await this.prisma.profile.findUnique({ where: { userId } });
+    if (existing) return existing;
+    return this.prisma.profile.create({
+      data: {
+        userId,
+        visibility: 'CONNECTIONS',
+        headline: '',
+        bio: '',
+        skills: [],
+        links: [],
+        lookingFor: [],
+      },
+    });
+  }
+
+  async getProfileByUserId(userId: string) {
+    await this.ensureProfile(userId);
+    return this.prisma.profile.findUnique({
+      where: { userId },
+      include: {
+        experiences: true,
+        educations: true,
+      },
+    });
+  }
+
+  async getPublicProfile(viewerId: string | null, userId: string) {
+    const profile = await this.prisma.profile.findUnique({
+      where: { userId },
+      include: {
+        user: { select: { id: true, fullName: true, ageMode: true, isVerifiedMentor: true, isVerifiedEmployer: true } },
+        experiences: true,
+        educations: true,
+      },
+    });
+    if (!profile) return null;
+
+    // Youth-safety: minors are not fully visible to unknown adults
+    const owner = await this.prisma.user.findUnique({ where: { id: userId } });
+    const viewer = viewerId ? await this.prisma.user.findUnique({ where: { id: viewerId } }) : null;
+
+    // Determine visibility
+    if (profile.visibility === 'PUBLIC') return profile;
+
+    if (!viewer) {
+      // No viewer auth → only minimal public fields
+      return {
+        userId: profile.userId,
+        headline: profile.headline,
+        skills: profile.skills,
+        visibility: profile.visibility,
+      };
+    }
+
+    // If connections-only visibility, check connection
+    if (profile.visibility === 'CONNECTIONS') {
+      const isConnected = await this.prisma.connection.findFirst({
+        where: {
+          OR: [
+            { requesterId: userId, addresseeId: viewerId, status: 'ACCEPTED' },
+            { requesterId: viewerId, addresseeId: userId, status: 'ACCEPTED' },
+          ],
+        },
+      });
+      if (isConnected) return profile;
+      // For minors, hide sensitive details
+      if (owner?.ageMode === 'YOUTH' && viewer?.ageMode !== 'YOUTH') {
+        return {
+          userId: profile.userId,
+          headline: profile.headline,
+          skills: profile.skills,
+          visibility: profile.visibility,
+          youthProtected: true,
+        };
+      }
+      // Fallback minimal
+      return {
+        userId: profile.userId,
+        headline: profile.headline,
+        skills: profile.skills,
+        visibility: profile.visibility,
+      };
+    }
+
+    // PRIVATE
+    if (viewerId === userId) return profile;
+    return { userId: profile.userId, visibility: profile.visibility };
+  }
+
+  async updateProfile(userId: string, dto: UpdateProfileDto) {
+    await this.ensureProfile(userId);
+
+    // Youth safety: minors cannot set PUBLIC visibility
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (user?.ageMode === 'YOUTH' && dto.visibility === 'PUBLIC') {
+      throw new ForbiddenException('Youth accounts cannot be fully public.');
+    }
+
+    return this.prisma.profile.update({
+      where: { userId },
+      data: {
+        headline: dto.headline,
+        bio: dto.bio,
+        locationCountry: dto.locationCountry,
+        locationCity: dto.locationCity,
+        visibility: dto.visibility,
+        skills: dto.skills ?? undefined,
+        links: dto.links ?? undefined,
+        lookingFor: dto.lookingFor ?? undefined,
+        // Upserts for experiences & educations handled separately in v1.1
+      },
+    });
+  }
+
+  async searchPeople(viewerId: string, q: SearchPeopleQueryDto) {
+    // Simple search by name, skills, city; excludes blocked & respects visibility
+    const viewerBlocks = await this.prisma.block.findMany({ where: { blockerId: viewerId } });
+    const blockedIds = viewerBlocks.map(b => b.blockedId);
+
+    const where: any = {
+      user: {
+        disabled: false,
+        NOT: { id: { in: blockedIds } },
+        ...(q.name
+          ? { fullName: { contains: q.name, mode: 'insensitive' } }
+          : {}),
+        ...(q.ageMode ? { ageMode: q.ageMode } : {}),
+      },
+      ...(q.locationCity ? { locationCity: { equals: q.locationCity, mode: 'insensitive' } } : {}),
+      ...(q.locationCountry ? { locationCountry: { equals: q.locationCountry, mode: 'insensitive' } } : {}),
+      ...(q.skill
+        ? { skills: { hasSome: [q.skill] } }
+        : {}),
+    };
+
+    const results = await this.prisma.profile.findMany({
+      where,
+      select: {
+        userId: true,
+        headline: true,
+        skills: true,
+        visibility: true,
+        locationCity: true,
+        locationCountry: true,
+        user: {
+          select: {
+            id: true,
+            fullName: true,
+            ageMode: true,
+            isVerifiedMentor: true,
+            isVerifiedEmployer: true,
+          },
+        },
+      },
+      take: Math.min(q.limit ?? 25, 50),
+      skip: q.offset ?? 0,
+      orderBy: [{ updatedAt: 'desc' }],
+    });
+
+    // If youth viewer, only return verified employers/mentors + other youth by default
+    const filtered =
+      (await this.prisma.user.findUnique({ where: { id: viewerId } }))?.ageMode === 'YOUTH'
+        ? results.filter(r =>
+            r.user.ageMode === 'YOUTH' || r.user.isVerifiedEmployer || r.user.isVerifiedMentor,
+          )
+        : results;
+
+    return filtered;
+  }
+}
+
+----- /apps/api/src/modules/profile/types/update-profile.dto.ts -----
+import { IsArray, IsEnum, IsOptional, IsString, MaxLength } from 'class-validator';
+
+export enum ProfileVisibility {
+  PUBLIC = 'PUBLIC',
+  CONNECTIONS = 'CONNECTIONS',
+  PRIVATE = 'PRIVATE',
+}
+
+export class UpdateProfileDto {
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  headline?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(2000)
+  bio?: string;
+
+  @IsOptional()
+  @IsString()
+  locationCountry?: string;
+
+  @IsOptional()
+  @IsString()
+  locationCity?: string;
+
+  @IsOptional()
+  @IsEnum(ProfileVisibility)
+  visibility?: ProfileVisibility;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  skills?: string[];
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  links?: string[];
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  lookingFor?: string[]; // e.g., ["internship", "part-time", "mentor"]
+}
+
+----- /apps/api/src/modules/profile/types/search-people.dto.ts -----
+import { IsEnum, IsNumber, IsOptional, IsString, Min } from 'class-validator';
+
+export enum AgeMode {
+  ADULT = 'ADULT',
+  YOUTH = 'YOUTH',
+}
+
+export class SearchPeopleQueryDto {
+  @IsOptional()
+  @IsString()
+  name?: string;
+
+  @IsOptional()
+  @IsString()
+  skill?: string;
+
+  @IsOptional()
+  @IsString()
+  locationCountry?: string;
+
+  @IsOptional()
+  @IsString()
+  locationCity?: string;
+
+  @IsOptional()
+  @IsEnum(AgeMode)
+  ageMode?: AgeMode;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  offset?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(1)
+  limit?: number;
+}
+
+----- /apps/api/src/modules/social/social.module.ts -----
+import { Module } from '@nestjs/common';
+import { SocialController } from './social.controller';
+import { SocialService } from './social.service';
+import { PrismaService } from '../../prisma/prisma.service';
+
+@Module({
+  controllers: [SocialController],
+  providers: [SocialService, PrismaService],
+  exports: [SocialService],
+})
+export class SocialModule {}
+
+----- /apps/api/src/modules/social/social.controller.ts -----
+import { Body, Controller, Get, Param, Patch, Post, UseGuards } from '@nestjs/common';
+import { SocialService } from './social.service';
+import { JwtAuthGuard } from '../../auth/guards/jwt.guard';
+import { CurrentUser } from '../../shared/decorators/current-user.decorator';
+import { SendRequestDto, RespondRequestDto } from './types/connection.dtos';
+
+@Controller('social')
+@UseGuards(JwtAuthGuard)
+export class SocialController {
+  constructor(private readonly social: SocialService) {}
+
+  @Get('connections')
+  myConnections(@CurrentUser() me: any) {
+    return this.social.listConnections(me.id);
+  }
+
+  @Get('connections/pending')
+  myPending(@CurrentUser() me: any) {
+    return this.social.listPending(me.id);
+  }
+
+  @Post('connections/request')
+  request(@CurrentUser() me: any, @Body() dto: SendRequestDto) {
+    return this.social.sendRequest(me.id, dto.targetUserId);
+  }
+
+  @Patch('connections/respond')
+  respond(@CurrentUser() me: any, @Body() dto: RespondRequestDto) {
+    return this.social.respondToRequest(me.id, dto.requestId, dto.action);
+  }
+
+  @Post('block/:userId')
+  block(@CurrentUser() me: any, @Param('userId') userId: string) {
+    return this.social.blockUser(me.id, userId);
+  }
+
+  @Post('unblock/:userId')
+  unblock(@CurrentUser() me: any, @Param('userId') userId: string) {
+    return this.social.unblockUser(me.id, userId);
+  }
+}
+
+----- /apps/api/src/modules/social/social.service.ts -----
+import { Injectable, BadRequestException, ForbiddenException } from '@nestjs/common';
+import { PrismaService } from '../../prisma/prisma.service';
+
+@Injectable()
+export class SocialService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async sendRequest(requesterId: string, addresseeId: string) {
+    if (requesterId === addresseeId) throw new BadRequestException('Cannot connect to self');
+
+    // Youth safety: if either is youth, apply restrictions
+    const requester = await this.prisma.user.findUnique({ where: { id: requesterId } });
+    const addressee = await this.prisma.user.findUnique({ where: { id: addresseeId } });
+
+    if (requester?.ageMode === 'YOUTH' || addressee?.ageMode === 'YOUTH') {
+      // Require at least one side to be verified (mentor or employer) or both youth
+      const allowed =
+        (requester?.ageMode === 'YOUTH' && addressee?.ageMode === 'YOUTH') ||
+        requester?.isVerifiedEmployer ||
+        requester?.isVerifiedMentor ||
+        addressee?.isVerifiedEmployer ||
+        addressee?.isVerifiedMentor;
+
+      if (!allowed) {
+        throw new ForbiddenException('Youth safety: connection requires verified mentor/employer or both youth.');
+      }
+    }
+
+    // Existing connection/request?
+    const existing = await this.prisma.connection.findFirst({
+      where: {
+        OR: [
+          { requesterId, addresseeId },
+          { requesterId: addresseeId, addresseeId: requesterId },
+        ],
+      },
+    });
+    if (existing) {
+      if (existing.status === 'BLOCKED') throw new ForbiddenException('You cannot connect with this user.');
+      if (existing.status === 'ACCEPTED') throw new BadRequestException('Already connected');
+      if (existing.status === 'PENDING') return existing; // idempotent
+    }
+
+    return this.prisma.connection.create({
+      data: { requesterId, addresseeId, status: 'PENDING' },
+    });
+  }
+
+  async respondToRequest(userId: string, requestId: string, action: 'ACCEPT' | 'REJECT' | 'CANCEL') {
+    const req = await this.prisma.connection.findUnique({ where: { id: requestId } });
+    if (!req) throw new BadRequestException('Request not found');
+
+    if (action === 'CANCEL') {
+      if (req.requesterId !== userId) throw new ForbiddenException('Only requester can cancel');
+      return this.prisma.connection.delete({ where: { id: requestId } });
+    }
+
+    if (req.addresseeId !== userId) throw new ForbiddenException('Only addressee can respond');
+
+    if (action === 'ACCEPT') {
+      return this.prisma.connection.update({ where: { id: requestId }, data: { status: 'ACCEPTED' } });
+    }
+    if (action === 'REJECT') {
+      return this.prisma.connection.update({ where: { id: requestId }, data: { status: 'REJECTED' } });
+    }
+  }
+
+  async listConnections(userId: string) {
+    const rows = await this.prisma.connection.findMany({
+      where: {
+        status: 'ACCEPTED',
+        OR: [{ requesterId: userId }, { addresseeId: userId }],
+      },
+      include: {
+        requester: { select: { id: true, fullName: true, ageMode: true } },
+        addressee: { select: { id: true, fullName: true, ageMode: true } },
+      },
+      orderBy: { updatedAt: 'desc' },
+    });
+
+    return rows.map(r => (r.requesterId === userId ? r.addressee : r.requester));
+  }
+
+  async listPending(userId: string) {
+    return this.prisma.connection.findMany({
+      where: { addresseeId: userId, status: 'PENDING' },
+      include: { requester: { select: { id: true, fullName: true } } },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  async blockUser(blockerId: string, blockedId: string) {
+    if (blockerId === blockedId) throw new BadRequestException('Cannot block yourself');
+
+    // Upsert block row
+    const block = await this.prisma.block.upsert({
+      where: { blockerId_blockedId: { blockerId, blockedId } },
+      update: { active: true },
+      create: { blockerId, blockedId, active: true },
+    });
+
+    // Clean up any connections/requests
+    await this.prisma.connection.deleteMany({
+      where: {
+        OR: [
+          { requesterId: blockerId, addresseeId: blockedId },
+          { requesterId: blockedId, addresseeId: blockerId },
+        ],
+      },
+    });
+
+    return block;
+  }
+
+  async unblockUser(blockerId: string, blockedId: string) {
+    return this.prisma.block.update({
+      where: { blockerId_blockedId: { blockerId, blockedId } },
+      data: { active: false },
+    });
+  }
+}
+
+----- /apps/api/src/modules/social/types/connection.dtos.ts -----
+import { IsIn, IsString } from 'class-validator';
+
+export class SendRequestDto {
+  @IsString()
+  targetUserId!: string;
+}
+
+export class RespondRequestDto {
+  @IsString()
+  requestId!: string;
+
+  @IsIn(['ACCEPT', 'REJECT', 'CANCEL'])
+  action!: 'ACCEPT' | 'REJECT' | 'CANCEL';
+}
+
+----- /apps/api/src/prisma/prisma.service.ts -----
+/**
+ * If you already have this from Bundle 01, keep your existing file.
+ * This is included for completeness in fresh setups.
+ */
+import { INestApplication, Injectable, OnModuleInit } from '@nestjs/common';
+import { PrismaClient } from '@prisma/client';
+
+@Injectable()
+export class PrismaService extends PrismaClient implements OnModuleInit {
+  async onModuleInit() {
+    await this.$connect();
+  }
+  async enableShutdownHooks(app: INestApplication) {
+    this.$on('beforeExit', async () => {
+      await app.close();
+    });
+  }
+}
+
+----- /apps/api/src/app.module.ts (append import & registration instructions) -----
+// Add the following lines into your existing AppModule imports:
+/*
+import { ProfileModule } from './modules/profile/profile.module';
+import { SocialModule } from './modules/social/social.module';
+...
+@Module({
+  imports: [
+    ...,
+    ProfileModule,
+    SocialModule,
+  ],
+})
+export class AppModule {}
+*/
+
+----- /prisma/migrations/2025-09-28-0002_profiles_social/migration.sql -----
+-- Profiles
+CREATE TABLE IF NOT EXISTS "Profile" (
+  "userId" TEXT PRIMARY KEY,
+  "headline" TEXT DEFAULT '',
+  "bio" TEXT DEFAULT '',
+  "skills" TEXT[] DEFAULT ARRAY[]::TEXT[],
+  "links" TEXT[] DEFAULT ARRAY[]::TEXT[],
+  "lookingFor" TEXT[] DEFAULT ARRAY[]::TEXT[],
+  "visibility" TEXT NOT NULL DEFAULT 'CONNECTIONS',
+  "locationCountry" TEXT,
+  "locationCity" TEXT,
+  "createdAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  "updatedAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  CONSTRAINT "Profile_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- Experiences (simplified)
+CREATE TABLE IF NOT EXISTS "Experience" (
+  "id" TEXT PRIMARY KEY,
+  "userId" TEXT NOT NULL,
+  "title" TEXT NOT NULL,
+  "company" TEXT,
+  "startDate" DATE,
+  "endDate" DATE,
+  "current" BOOLEAN DEFAULT FALSE,
+  "description" TEXT,
+  "createdAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  "updatedAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  CONSTRAINT "Experience_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- Educations (simplified)
+CREATE TABLE IF NOT EXISTS "Education" (
+  "id" TEXT PRIMARY KEY,
+  "userId" TEXT NOT NULL,
+  "school" TEXT NOT NULL,
+  "degree" TEXT,
+  "field" TEXT,
+  "startDate" DATE,
+  "endDate" DATE,
+  "description" TEXT,
+  "createdAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  "updatedAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  CONSTRAINT "Education_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- Connections
+CREATE TYPE "ConnectionStatus" AS ENUM ('PENDING', 'ACCEPTED', 'REJECTED', 'BLOCKED');
+CREATE TABLE IF NOT EXISTS "Connection" (
+  "id" TEXT PRIMARY KEY,
+  "requesterId" TEXT NOT NULL,
+  "addresseeId" TEXT NOT NULL,
+  "status" "ConnectionStatus" NOT NULL DEFAULT 'PENDING',
+  "createdAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  "updatedAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  CONSTRAINT "Connection_requesterId_fkey" FOREIGN KEY ("requesterId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT "Connection_addresseeId_fkey" FOREIGN KEY ("addresseeId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- Block list
+CREATE TABLE IF NOT EXISTS "Block" (
+  "blockerId" TEXT NOT NULL,
+  "blockedId" TEXT NOT NULL,
+  "active" BOOLEAN NOT NULL DEFAULT TRUE,
+  "createdAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  PRIMARY KEY ("blockerId", "blockedId"),
+  CONSTRAINT "Block_blockerId_fkey" FOREIGN KEY ("blockerId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT "Block_blockedId_fkey" FOREIGN KEY ("blockedId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS "idx_profile_city_country" ON "Profile"("locationCountry", "locationCity");
+CREATE INDEX IF NOT EXISTS "idx_profile_skills_gin" ON "Profile" USING GIN ("skills");
+CREATE INDEX IF NOT EXISTS "idx_connection_users" ON "Connection"("requesterId", "addresseeId");
+
+----- /prisma/schema.partial.profile.prisma -----
+// Merge this into prisma/schema.prisma (beneath your existing datasource & generator blocks)
+
+model Profile {
+  userId          String   @id
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  headline        String   @default("")
+  bio             String   @default("")
+  skills          String[] @default([])
+  links           String[] @default([])
+  lookingFor      String[] @default([])
+  visibility      ProfileVisibility @default(CONNECTIONS)
+  locationCountry String?
+  locationCity    String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  experiences     Experience[]
+  educations      Education[]
+}
+
+enum ProfileVisibility {
+  PUBLIC
+  CONNECTIONS
+  PRIVATE
+}
+
+model Experience {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title       String
+  company     String?
+  startDate   DateTime?
+  endDate     DateTime?
+  current     Boolean  @default(false)
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Education {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  school      String
+  degree      String?
+  field       String?
+  startDate   DateTime?
+  endDate     DateTime?
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+enum ConnectionStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  BLOCKED
+}
+
+model Connection {
+  id          String           @id @default(cuid())
+  requesterId String
+  addresseeId String
+  requester   User             @relation("RequesterConnections", fields: [requesterId], references: [id], onDelete: Cascade)
+  addressee   User             @relation("AddresseeConnections", fields: [addresseeId], references: [id], onDelete: Cascade)
+  status      ConnectionStatus @default(PENDING)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  @@index([requesterId, addresseeId])
+}
+
+model Block {
+  blockerId String
+  blockedId String
+  blocker   User   @relation("Blocker", fields: [blockerId], references: [id], onDelete: Cascade)
+  blocked   User   @relation("Blocked", fields: [blockedId], references: [id], onDelete: Cascade)
+  active    Boolean @default(true)
+  createdAt DateTime @default(now())
+  @@id([blockerId, blockedId])
+}
+
+----- /packages/contracts/src/profile.ts -----
+export type ProfileVisibility = 'PUBLIC' | 'CONNECTIONS' | 'PRIVATE';
+
+export interface Profile {
+  userId: string;
+  headline: string;
+  bio: string;
+  skills: string[];
+  links: string[];
+  lookingFor: string[];
+  visibility: ProfileVisibility;
+  locationCountry?: string;
+  locationCity?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface PublicProfile extends Partial<Profile> {
+  user?: {
+    id: string;
+    fullName: string;
+    ageMode: 'ADULT' | 'YOUTH';
+    isVerifiedMentor?: boolean;
+    isVerifiedEmployer?: boolean;
+  };
+  youthProtected?: boolean;
+}
+
+export interface UpdateProfileDto {
+  headline?: string;
+  bio?: string;
+  skills?: string[];
+  links?: string[];
+  lookingFor?: string[];
+  visibility?: ProfileVisibility;
+  locationCountry?: string;
+  locationCity?: string;
+}
+
+export interface SearchPeopleQuery {
+  name?: string;
+  skill?: string;
+  locationCountry?: string;
+  locationCity?: string;
+  ageMode?: 'ADULT' | 'YOUTH';
+  offset?: number;
+  limit?: number;
+}
+
+----- /packages/contracts/src/social.ts -----
+export type ConnectionAction = 'ACCEPT' | 'REJECT' | 'CANCEL';
+
+export interface ConnectionRequest {
+  id: string;
+  requesterId: string;
+  addresseeId: string;
+  status: 'PENDING' | 'ACCEPTED' | 'REJECTED' | 'BLOCKED';
+  createdAt: string;
+  updatedAt: string;
+}
+
+----- /packages/sdk/src/profile.ts -----
+import { Profile, PublicProfile, UpdateProfileDto, SearchPeopleQuery } from '@lockedin/contracts/profile';
+import { api } from './transport'; // provided in Bundle 01
+
+export const ProfileApi = {
+  me: async () => api.get<Profile>('/profile/me'),
+  update: async (dto: UpdateProfileDto) => api.patch<Profile>('/profile/me', dto),
+  get: async (userId: string) => api.get<PublicProfile>(`/profile/${userId}`),
+  search: async (q: SearchPeopleQuery) => api.get<PublicProfile[]>('/profile', { params: q }),
+};
+
+----- /packages/sdk/src/social.ts -----
+import { ConnectionAction, ConnectionRequest } from '@lockedin/contracts/social';
+import { api } from './transport'; // provided in Bundle 01
+
+export const SocialApi = {
+  myConnections: async () => api.get<any[]>('/social/connections'),
+  myPending: async () => api.get<ConnectionRequest[]>('/social/connections/pending'),
+  request: async (targetUserId: string) => api.post('/social/connections/request', { targetUserId }),
+  respond: async (requestId: string, action: ConnectionAction) =>
+    api.patch('/social/connections/respond', { requestId, action }),
+  block: async (userId: string) => api.post(`/social/block/${userId}`),
+  unblock: async (userId: string) => api.post(`/social/unblock/${userId}`),
+};
+
+----- /apps/web/src/pages/People.tsx -----
+import React, { useEffect, useState } from 'react';
+import { ProfileApi } from '@lockedin/sdk/profile';
+import { SocialApi } from '@lockedin/sdk/social';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { UserIcon, MapPinIcon, SparklesIcon, ShieldCheckIcon, UserPlusIcon, CheckIcon, XIcon, SearchIcon } from 'lucide-react';
+import { motion } from 'framer-motion';
+
+type PublicProfile = Awaited<ReturnType<typeof ProfileApi.search>> extends Promise<infer T> ? T extends Array<infer U> ? U : never : never;
+
+export default function PeoplePage() {
+  const [items, setItems] = useState<PublicProfile[]>([]);
+  const [q, setQ] = useState({ name: '', skill: '', locationCountry: '', locationCity: '' });
+  const [loading, setLoading] = useState(false);
+  const [pending, setPending] = useState<string[]>([]);
+
+  const run = async () => {
+    setLoading(true);
+    try {
+      const res = await ProfileApi.search({
+        name: q.name || undefined,
+        skill: q.skill || undefined,
+        locationCountry: q.locationCountry || undefined,
+        locationCity: q.locationCity || undefined,
+      });
+      setItems(res);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { run(); }, []);
+
+  const connect = async (userId: string) => {
+    setPending(p => [...p, userId]);
+    try {
+      await SocialApi.request(userId);
+    } finally {
+      setPending(p => p.filter(id => id !== userId));
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 via-white to-blue-50 p-6 md:p-8">
+      <div className="max-w-6xl mx-auto">
+        <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="mb-6">
+          <h1 className="text-3xl md:text-4xl font-bold text-gray-900">Find People</h1>
+          <p className="text-gray-600">Search for classmates, mentors, and verified employers.</p>
+        </motion.div>
+
+        <Card className="mb-6 bg-white/90 backdrop-blur border border-gray-200/60 shadow-md">
+          <CardContent className="p-4 grid grid-cols-1 md:grid-cols-5 gap-3">
+            <div className="md:col-span-2 relative">
+              <SearchIcon className="w-4 h-4 absolute left-3 top-3 text-gray-400" />
+              <Input placeholder="Name" className="pl-9" value={q.name} onChange={e => setQ({ ...q, name: e.target.value })} />
+            </div>
+            <Input placeholder="Skill (e.g. Python)" value={q.skill} onChange={e => setQ({ ...q, skill: e.target.value })} />
+            <Input placeholder="Country" value={q.locationCountry} onChange={e => setQ({ ...q, locationCountry: e.target.value })} />
+            <Input placeholder="City" value={q.locationCity} onChange={e => setQ({ ...q, locationCity: e.target.value })} />
+            <div className="md:col-span-5 flex justify-end gap-3">
+              <Button variant="outline" onClick={() => { setQ({ name: '', skill: '', locationCountry: '', locationCity: '' }); run(); }}>Clear</Button>
+              <Button onClick={run} disabled={loading}>{loading ? 'Searching…' : 'Search'}</Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        <div className="grid gap-4">
+          {items.map((p, i) => (
+            <motion.div key={p.user?.id || p.userId || i} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
+              <Card className="bg-white/90 border border-gray-200/60 hover:shadow-lg transition">
+                <CardHeader className="pb-2">
+                  <div className="flex items-start justify-between">
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-full bg-gradient-to-r from-indigo-400 to-purple-400 flex items-center justify-center">
+                        <UserIcon className="w-5 h-5 text-white" />
+                      </div>
+                      <div>
+                        <CardTitle className="text-lg">{p.user?.fullName || 'User'}</CardTitle>
+                        <div className="text-xs text-gray-500 flex items-center gap-2">
+                          {p.user?.ageMode === 'YOUTH' ? (
+                            <Badge className="bg-emerald-100 text-emerald-800">Youth</Badge>
+                          ) : null}
+                          {p.user?.isVerifiedEmployer ? (
+                            <Badge className="bg-blue-100 text-blue-800 flex items-center gap-1"><ShieldCheckIcon className="w-3 h-3" /> Employer</Badge>
+                          ) : null}
+                          {p.user?.isVerifiedMentor ? (
+                            <Badge className="bg-indigo-100 text-indigo-800 flex items-center gap-1"><SparklesIcon className="w-3 h-3" /> Mentor</Badge>
+                          ) : null}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="text-xs text-gray-500 flex items-center gap-2">
+                      <MapPinIcon className="w-4 h-4" />
+                      <span>{p.locationCity || '—'}, {p.locationCountry || '—'}</span>
+                    </div>
+                  </div>
+                </CardHeader>
+                <CardContent className="pt-0">
+                  <p className="text-sm text-gray-700 mb-2">{p.headline || '—'}</p>
+                  <div className="flex flex-wrap gap-1">
+                    {(p.skills || []).slice(0, 6).map(s => (
+                      <Badge key={s} variant="secondary" className="text-xs bg-gray-100">{s}</Badge>
+                    ))}
+                  </div>
+                  <div className="mt-4 flex justify-end">
+                    <Button size="sm" onClick={() => connect(p.user?.id || p.userId!)} disabled={pending.includes(p.user?.id || p.userId!) || p.youthProtected}>
+                      {pending.includes(p.user?.id || p.userId!) ? 'Requesting…' : (
+                        <span className="inline-flex items-center gap-2"><UserPlusIcon className="w-4 h-4" />Connect</span>
+                      )}
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            </motion.div>
+          ))}
+          {items.length === 0 && (
+            <Card className="bg-white/90 border border-gray-200/60">
+              <CardContent className="p-6 text-center text-gray-600">No people found. Try adjusting filters.</CardContent>
+            </Card>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+----- /apps/web/src/pages/Profile.tsx (replace your current simple Profile with this v2) -----
+import React, { useEffect, useState } from 'react';
+import { ProfileApi } from '@lockedin/sdk/profile';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
+import { Badge } from '@/components/ui/badge';
+import { StarIcon, SaveIcon, MapPinIcon, ShieldCheckIcon, SparklesIcon } from 'lucide-react';
+import { motion } from 'framer-motion';
+
+export default function ProfilePage() {
+  const [me, setMe] = useState<any>(null);
+  const [form, setForm] = useState<any>(null);
+  const [saving, setSaving] = useState(false);
+
+  const load = async () => {
+    const p = await ProfileApi.me();
+    setMe(p);
+    setForm({
+      headline: p.headline || '',
+      bio: p.bio || '',
+      skills: p.skills || [],
+      links: p.links || [],
+      visibility: p.visibility || 'CONNECTIONS',
+      locationCountry: p.locationCountry || '',
+      locationCity: p.locationCity || '',
+    });
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await ProfileApi.update(form);
+      await load();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const score = (() => {
+    let s = 0;
+    if (form?.headline) s += 20;
+    if (form?.bio) s += 20;
+    if ((form?.skills || []).length > 0) s += 25;
+    if ((form?.links || []).length > 0) s += 10;
+    if (form?.locationCountry || form?.locationCity) s += 15;
+    if (form?.visibility && form.visibility !== 'PRIVATE') s += 10;
+    return Math.min(100, s);
+  })();
+
+  const addSkill = (sk: string) => {
+    if (!sk.trim()) return;
+    if (form.skills.includes(sk.trim())) return;
+    setForm({ ...form, skills: [...form.skills, sk.trim()] });
+  };
+
+  const removeSkill = (sk: string) => {
+    setForm({ ...form, skills: form.skills.filter((s: string) => s !== sk) });
+  };
+
+  if (!form) return null;
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 via-white to-blue-50 p-6 md:p-8">
+      <div className="max-w-4xl mx-auto space-y-6">
+        <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="flex items-center justify-between">
+          <h1 className="text-3xl md:text-4xl font-bold text-gray-900">My Profile</h1>
+          <Button onClick={save} disabled={saving} className="inline-flex items-center gap-2">
+            <SaveIcon className="w-4 h-4" />
+            {saving ? 'Saving…' : 'Save'}
+          </Button>
+        </motion.div>
+
+        {me?.user?.ageMode === 'YOUTH' && (
+          <Card className="bg-emerald-50 border border-emerald-200">
+            <CardContent className="p-4 text-emerald-800 text-sm flex items-center gap-2">
+              <ShieldCheckIcon className="w-4 h-4" />
+              Youth Safety Mode active — your profile defaults to “Connections” visibility.
+            </CardContent>
+          </Card>
+        )}
+
+        <Card className="bg-gradient-to-r from-indigo-50 to-purple-50 border border-indigo-200/60">
+          <CardHeader>
+            <CardTitle className="text-indigo-900 flex items-center gap-2">
+              <StarIcon className="w-5 h-5 text-indigo-600" /> Profile Strength: {score}%
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="w-full bg-indigo-200 h-2 rounded">
+              <motion.div className="h-2 rounded bg-gradient-to-r from-indigo-500 to-indigo-600" initial={{ width: 0 }} animate={{ width: `${score}%` }} />
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-white/90 border border-gray-200/60">
+          <CardHeader><CardTitle>Basic Info</CardTitle></CardHeader>
+          <CardContent className="space-y-3">
+            <div className="grid md:grid-cols-2 gap-3">
+              <div>
+                <label className="text-sm text-gray-600">Headline</label>
+                <Input value={form.headline} onChange={e => setForm({ ...form, headline: e.target.value })} placeholder="e.g., Student Developer • Open to internships" />
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="text-sm text-gray-600">Country</label>
+                  <Input value={form.locationCountry} onChange={e => setForm({ ...form, locationCountry: e.target.value })} />
+                </div>
+                <div>
+                  <label className="text-sm text-gray-600">City</label>
+                  <Input value={form.locationCity} onChange={e => setForm({ ...form, locationCity: e.target.value })} />
+                </div>
+              </div>
+            </div>
+            <div>
+              <label className="text-sm text-gray-600">Bio</label>
+              <Textarea rows={5} value={form.bio} onChange={e => setForm({ ...form, bio: e.target.value })} placeholder="Tell people who you are, what you’re looking for, and what you’ve built." />
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-white/90 border border-gray-200/60">
+          <CardHeader><CardTitle>Skills</CardTitle></CardHeader>
+          <CardContent>
+            <div className="flex gap-2 mb-3">
+              <Input placeholder="Add a skill then press Enter" onKeyDown={e => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  addSkill((e.target as HTMLInputElement).value);
+                  (e.target as HTMLInputElement).value = '';
+                }
+              }} />
+              <Button type="button" onClick={() => {
+                const el = document.querySelector<HTMLInputElement>('input[placeholder^="Add a skill"]');
+                if (el && el.value) { addSkill(el.value); el.value=''; }
+              }}>Add</Button>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {form.skills.map((s: string) => (
+                <Badge key={s} className="bg-indigo-100 text-indigo-800 hover:bg-indigo-200">
+                  {s}
+                  <button className="ml-1 text-indigo-700" onClick={() => removeSkill(s)}>×</button>
+                </Badge>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-white/90 border border-gray-200/60">
+          <CardHeader><CardTitle>Links</CardTitle></CardHeader>
+          <CardContent className="space-y-2">
+            <div className="text-xs text-gray-500">Add portfolio, personal site, or public profiles.</div>
+            <div className="flex flex-col gap-2">
+              {(form.links || []).map((l: string, idx: number) => (
+                <div key={idx} className="flex gap-2">
+                  <Input value={l} onChange={e => {
+                    const copy = [...form.links];
+                    copy[idx] = e.target.value;
+                    setForm({ ...form, links: copy });
+                  }} />
+                  <Button variant="outline" onClick={() => setForm({ ...form, links: form.links.filter((_: any, i: number) => i !== idx) })}>Remove</Button>
+                </div>
+              ))}
+              <Button variant="outline" onClick={() => setForm({ ...form, links: [...(form.links || []), ''] })}>Add Link</Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-white/90 border border-gray-200/60">
+          <CardHeader><CardTitle>Privacy</CardTitle></CardHeader>
+          <CardContent>
+            <div className="grid md:grid-cols-3 gap-3">
+              {(['PUBLIC','CONNECTIONS','PRIVATE'] as const).map(v => (
+                <Button key={v} variant={form.visibility === v ? 'default' : 'outline'} onClick={() => setForm({ ...form, visibility: v })}>
+                  {v}
+                </Button>
+              ))}
+            </div>
+            {me?.user?.ageMode === 'YOUTH' && form.visibility === 'PUBLIC' && (
+              <div className="mt-3 text-sm text-red-600 flex items-center gap-2">
+                <SparklesIcon className="w-4 h-4" />
+                Youth accounts cannot be fully public — choose Connections or Private.
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+----- /apps/web/src/routes/people.ts (route registration snippet) -----
+// Add this to your app routing to expose People page
+/*
+import PeoplePage from '@/pages/People';
+...
+{ path: '/people', element: <PeoplePage /> }
+*/
+
+----- /apps/web/src/components/ConnectionButton.tsx -----
+import React from 'react';
+import { Button } from '@/components/ui/button';
+import { UserPlusIcon } from 'lucide-react';
+import { SocialApi } from '@lockedin/sdk/social';
+
+export function ConnectionButton({ userId }: { userId: string }) {
+  const [loading, setLoading] = React.useState(false);
+  const onClick = async () => {
+    setLoading(true);
+    try {
+      await SocialApi.request(userId);
+    } finally {
+      setLoading(false);
+    }
+  };
+  return (
+    <Button size="sm" onClick={onClick} disabled={loading}>
+      <UserPlusIcon className="w-4 h-4 mr-1" /> {loading ? 'Requesting…' : 'Connect'}
+    </Button>
+  );
+}
+
+----- /apps/api/README-BUNDLE-02.md -----
+# Bundle 02 — Profiles + Social Graph
+
+## What’s included
+- Profile CRUD with visibility/privacy (PUBLIC / CONNECTIONS / PRIVATE)
+- Youth-safety logic in profile visibility + connection gating
+- People search (name, skill, location) with youth filters
+- Connections (request / accept / reject / cancel), block/unblock
+- Prisma migration SQL and schema partial
+- Web UI: Profile (v2), People search + connect
+
+## Apply DB changes
+If you used Bundle 01 with Prisma:
+1. Apply SQL migration (zero-downtime safe on new tables):
+   ```bash
+   psql "$DATABASE_URL" -f prisma/migrations/2025-09-28-0002_profiles_social/migration.sql
+   ```
+2. Merge `prisma/schema.partial.profile.prisma` into `prisma/schema.prisma` and generate:
+   ```bash
+   npx prisma generate
+   ```
+
+## Wire modules
+In `apps/api/src/app.module.ts`, import and register `ProfileModule` and `SocialModule` (see snippet in this bundle).
+
+## Run
+```bash
+pnpm -w build
+pnpm -w dev
+```
+
+## Next
+- Bundle 03: Feed (posts), reactions, comments, report/flag — youth-safe.
+- Bundle 04: Messaging (youth DM restrictions + guardian audit options).
+- Bundle 05: Job Graph (search, filters, recs) + company verification.
+- Bundle 06+: AI résumé tailoring, profile insights, safety heuristics.
+
+──────────────────────────────────────────────────────────────────────────────
+END OF BUNDLE 02

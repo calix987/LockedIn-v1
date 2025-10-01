@@ -1,0 +1,1047 @@
+# lockedin-bundle-06.txt
+# Bundle 06 — Realtime Messaging + In‑App Notifications
+# Monorepo layout assumed:
+# /apps/api (NestJS) • /apps/web (React+Vite) • /packages/contracts (shared types) • /prisma (Prisma schema)
+# This bundle adds: 1:1 & group chats, typing indicators, presence, read receipts, safety/abuse controls,
+# and in‑app notifications. No secrets included. All configurable via env.
+
+================================================================================
+apps/api/src/modules/messaging/messaging.module.ts
+================================================================================
+import { Module } from '@nestjs/common';
+import { MessagingService } from './messaging.service';
+import { MessagingController } from './messaging.controller';
+import { MessagingGateway } from './messaging.gateway';
+import { PrismaService } from '../../prisma/prisma.service';
+import { YouthSafetyGuard } from './youth-safety.guard';
+import { RateLimitGuard } from './rate-limit.guard';
+import { NotificationsModule } from '../notifications/notifications.module';
+
+@Module({
+  imports: [NotificationsModule],
+  controllers: [MessagingController],
+  providers: [MessagingService, MessagingGateway, PrismaService, YouthSafetyGuard, RateLimitGuard],
+  exports: [MessagingService],
+})
+export class MessagingModule {}
+
+================================================================================
+apps/api/src/modules/messaging/messaging.controller.ts
+================================================================================
+import { Body, Controller, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { MessagingService } from './messaging.service';
+import { SendMessageDto } from './dto/send-message.dto';
+import { PaginateDto } from './dto/paginate.dto';
+import { YouthSafetyGuard } from './youth-safety.guard';
+import { RateLimitGuard } from './rate-limit.guard';
+
+@Controller('messaging')
+@UseGuards(RateLimitGuard)
+export class MessagingController {
+  constructor(private readonly messaging: MessagingService) {}
+
+  @Get('conversations')
+  async listConversations(
+    @Query('userId') userId: string,
+    @Query() page: PaginateDto,
+  ) {
+    return this.messaging.listConversations(userId, page);
+  }
+
+  @Get('conversations/:id')
+  async getConversation(@Param('id') id: string, @Query('userId') userId: string) {
+    return this.messaging.getConversation(userId, id);
+  }
+
+  @Get('conversations/:id/messages')
+  async listMessages(
+    @Param('id') id: string,
+    @Query() page: PaginateDto,
+    @Query('userId') userId: string,
+  ) {
+    return this.messaging.listMessages(userId, id, page);
+  }
+
+  @Post('conversations')
+  async createConversation(@Body() body: { creatorId: string; participantIds: string[]; title?: string }) {
+    return this.messaging.createConversation(body.creatorId, body.participantIds, body.title);
+  }
+
+  @Post('messages')
+  @UseGuards(YouthSafetyGuard)
+  async sendMessage(@Body() dto: SendMessageDto) {
+    return this.messaging.sendMessage(dto);
+  }
+
+  @Post('messages/read')
+  async markRead(@Body() body: { userId: string; conversationId: string; messageId?: string }) {
+    return this.messaging.markRead(body.userId, body.conversationId, body.messageId);
+  }
+
+  @Post('conversations/:id/typing')
+  async setTyping(@Param('id') id: string, @Body() body: { userId: string; typing: boolean }) {
+    return this.messaging.setTyping(body.userId, id, body.typing);
+  }
+
+  @Post('block')
+  async block(@Body() body: { userId: string; targetUserId: string }) {
+    return this.messaging.blockUser(body.userId, body.targetUserId);
+  }
+
+  @Post('report')
+  async report(@Body() body: { reporterId: string; targetUserId: string; reason: string }) {
+    return this.messaging.reportUser(body.reporterId, body.targetUserId, body.reason);
+  }
+}
+
+================================================================================
+apps/api/src/modules/messaging/messaging.service.ts
+================================================================================
+import { Injectable, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { PrismaService } from '../../prisma/prisma.service';
+import { SendMessageDto } from './dto/send-message.dto';
+import { PaginateDto } from './dto/paginate.dto';
+import { sanitizeMessage } from './profanity';
+import { MessagingGateway } from './messaging.gateway';
+import { NotificationsService } from '../notifications/notifications.service';
+
+@Injectable()
+export class MessagingService {
+  constructor(
+    private prisma: PrismaService,
+    private gateway: MessagingGateway,
+    private notifications: NotificationsService,
+  ) {}
+
+  async listConversations(userId: string, page: PaginateDto) {
+    const take = Math.min(Math.max(page.limit ?? 20, 1), 100);
+    const skip = Math.max((page.page ?? 1) - 1, 0) * take;
+    const items = await this.prisma.conversation.findMany({
+      where: { participants: { some: { userId } } },
+      include: {
+        participants: true,
+        lastMessage: true,
+      },
+      orderBy: { updatedAt: 'desc' },
+      skip, take,
+    });
+    const total = await this.prisma.conversation.count({ where: { participants: { some: { userId } } } });
+    return { items, total, page: page.page ?? 1, limit: take };
+  }
+
+  async getConversation(userId: string, id: string) {
+    const conv = await this.prisma.conversation.findFirst({
+      where: { id, participants: { some: { userId } } },
+      include: { participants: true, lastMessage: true },
+    });
+    if (!conv) throw new NotFoundException('Conversation not found');
+    return conv;
+  }
+
+  async listMessages(userId: string, conversationId: string, page: PaginateDto) {
+    // Membership check
+    const member = await this.prisma.conversationParticipant.findFirst({
+      where: { conversationId, userId },
+    });
+    if (!member) throw new ForbiddenException('Not a participant');
+
+    const take = Math.min(Math.max(page.limit ?? 50, 1), 200);
+    const skip = Math.max((page.page ?? 1) - 1, 0) * take;
+    const items = await this.prisma.message.findMany({
+      where: { conversationId },
+      include: { sender: true },
+      orderBy: { createdAt: 'desc' },
+      skip, take,
+    });
+    const total = await this.prisma.message.count({ where: { conversationId } });
+    return { items: items.reverse(), total, page: page.page ?? 1, limit: take };
+  }
+
+  async createConversation(creatorId: string, participantIds: string[], title?: string) {
+    const distinct = Array.from(new Set([creatorId, ...participantIds]));
+    if (distinct.length < 2) throw new ForbiddenException('Need at least 2 participants');
+    const conv = await this.prisma.conversation.create({
+      data: {
+        title: title ?? null,
+        participants: {
+          create: distinct.map((uid) => ({ userId: uid })),
+        },
+      },
+      include: { participants: true },
+    });
+    this.gateway.emitConversationCreated(distinct, conv);
+    return conv;
+  }
+
+  async sendMessage(dto: SendMessageDto) {
+    // Check blocking
+    const blocked = await this.prisma.block.findFirst({
+      where: {
+        OR: [
+          { userId: dto.recipientId, targetUserId: dto.senderId },
+          { userId: dto.senderId, targetUserId: dto.recipientId },
+        ],
+      },
+    });
+    if (blocked) throw new ForbiddenException('Messaging is blocked between these users');
+
+    // Ensure conversation exists (1:1 shortcut)
+    let conversationId = dto.conversationId;
+    if (!conversationId) {
+      const existing = await this.prisma.conversation.findFirst({
+        where: {
+          participants: {
+            every: {
+              userId: { in: [dto.senderId, dto.recipientId] },
+            },
+          },
+          isGroup: false,
+        },
+      });
+      conversationId = existing?.id ?? (
+        await this.createConversation(dto.senderId, [dto.recipientId])
+      ).id;
+    }
+
+    const content = sanitizeMessage(dto.content ?? '');
+    const message = await this.prisma.message.create({
+      data: {
+        conversationId,
+        senderId: dto.senderId,
+        content,
+        attachmentUrl: dto.attachmentUrl ?? null,
+        meta: dto.meta ?? null,
+      },
+      include: { sender: true },
+    });
+
+    // Update conversation lastMessage + updatedAt
+    await this.prisma.conversation.update({
+      where: { id: conversationId },
+      data: { lastMessageId: message.id, updatedAt: new Date() },
+    });
+
+    // Socket events
+    const recipients = await this.prisma.conversationParticipant.findMany({
+      where: { conversationId },
+    });
+    const recipientIds = recipients.map((p) => p.userId).filter((id) => id !== dto.senderId);
+    this.gateway.emitMessage(recipientIds, message);
+
+    // Create in‑app notifications for recipients
+    await Promise.all(
+      recipientIds.map((rid) =>
+        this.notifications.create({
+          userId: rid,
+          type: 'MESSAGE',
+          title: 'New message',
+          body: message.content?.slice(0, 140) ?? 'New message',
+          data: { conversationId, messageId: message.id, senderId: dto.senderId },
+        }),
+      ),
+    );
+
+    return message;
+  }
+
+  async markRead(userId: string, conversationId: string, messageId?: string) {
+    // Ensure participant
+    const part = await this.prisma.conversationParticipant.findFirst({ where: { conversationId, userId } });
+    if (!part) throw new ForbiddenException('Not a participant');
+
+    // Mark read upto messageId (or all)
+    const last = await this.prisma.message.findFirst({
+      where: { conversationId },
+      orderBy: { createdAt: 'desc' },
+    });
+    const lastReadMessageId = messageId ?? last?.id ?? null;
+
+    await this.prisma.conversationParticipant.update({
+      where: { id: part.id },
+      data: { lastReadMessageId, lastReadAt: new Date() },
+    });
+
+    // Broadcast read receipt
+    const others = await this.prisma.conversationParticipant.findMany({ where: { conversationId } });
+    const otherIds = others.map((p) => p.userId).filter((id) => id !== userId);
+    this.gateway.emitReadReceipt(otherIds, { conversationId, userId, messageId: lastReadMessageId });
+    return { ok: true, lastReadMessageId };
+  }
+
+  async setTyping(userId: string, conversationId: string, typing: boolean) {
+    const part = await this.prisma.conversationParticipant.findFirst({ where: { conversationId, userId } });
+    if (!part) throw new ForbiddenException('Not a participant');
+    const others = await this.prisma.conversationParticipant.findMany({ where: { conversationId } });
+    const otherIds = others.map((p) => p.userId).filter((id) => id !== userId);
+    this.gateway.emitTyping(otherIds, { conversationId, userId, typing });
+    return { ok: true };
+  }
+
+  async blockUser(userId: string, targetUserId: string) {
+    await this.prisma.block.upsert({
+      where: { userId_targetUserId: { userId, targetUserId } },
+      update: {},
+      create: { userId, targetUserId },
+    });
+    return { ok: true };
+  }
+
+  async reportUser(reporterId: string, targetUserId: string, reason: string) {
+    await this.prisma.report.create({
+      data: { reporterId, targetUserId, reason: reason?.slice(0, 500) ?? 'Unspecified' },
+    });
+    return { ok: true };
+  }
+}
+
+================================================================================
+apps/api/src/modules/messaging/messaging.gateway.ts
+================================================================================
+import {
+  WebSocketGateway, WebSocketServer, SubscribeMessage, ConnectedSocket, MessageBody,
+} from '@nestjs/websockets';
+import { Server, Socket } from 'socket.io';
+
+@WebSocketGateway({
+  cors: {
+    origin: process.env.SOCKET_CORS_ORIGIN?.split(',') ?? '*',
+    credentials: true,
+  },
+  path: process.env.SOCKET_PATH || '/socket.io',
+})
+export class MessagingGateway {
+  @WebSocketServer()
+  server: Server;
+
+  handleConnection(client: Socket) {
+    // Expect an auth handshake token in query (opaque). Real auth should be added in prod.
+    // Client will join a room = userId for direct emits.
+    const userId = client.handshake.query['userId'];
+    if (typeof userId === 'string') {
+      client.join(userId);
+      this.server.to(userId).emit('presence:self', { online: true });
+    }
+  }
+
+  handleDisconnect(client: Socket) {
+    const userId = client.handshake.query['userId'];
+    if (typeof userId === 'string') {
+      this.server.to(userId).emit('presence:self', { online: false });
+    }
+  }
+
+  emitMessage(recipientIds: string[], payload: any) {
+    recipientIds.forEach((id) => this.server.to(id).emit('message:new', payload));
+  }
+
+  emitReadReceipt(recipientIds: string[], payload: any) {
+    recipientIds.forEach((id) => this.server.to(id).emit('message:read', payload));
+  }
+
+  emitTyping(recipientIds: string[], payload: any) {
+    recipientIds.forEach((id) => this.server.to(id).emit('typing', payload));
+  }
+
+  emitConversationCreated(recipientIds: string[], payload: any) {
+    recipientIds.forEach((id) => this.server.to(id).emit('conversation:created', payload));
+  }
+
+  @SubscribeMessage('typing')
+  handleTyping(@ConnectedSocket() client: Socket, @MessageBody() body: { conversationId: string; typing: boolean }) {
+    // This pass-through exists if you later want pure socket typing calls.
+    const userId = client.handshake.query['userId'];
+    if (typeof userId === 'string') {
+      // broadcast to others in room (if you add room-per-conv later)
+      client.broadcast.emit('typing', { conversationId: body.conversationId, userId, typing: body.typing });
+    }
+  }
+}
+
+================================================================================
+apps/api/src/modules/messaging/dto/send-message.dto.ts
+================================================================================
+export class SendMessageDto {
+  senderId!: string;
+  recipientId?: string; // when creating a new 1:1
+  conversationId?: string; // existing conversation
+  content?: string;
+  attachmentUrl?: string | null;
+  meta?: Record<string, any> | null;
+}
+
+================================================================================
+apps/api/src/modules/messaging/dto/paginate.dto.ts
+================================================================================
+export class PaginateDto {
+  page?: number;
+  limit?: number;
+}
+
+================================================================================
+apps/api/src/modules/messaging/profanity.ts
+================================================================================
+const banned = ['badword1', 'badword2']; // placeholder — swap with a library or moderation service
+export function sanitizeMessage(text: string): string {
+  let out = text;
+  for (const w of banned) {
+    const re = new RegExp(w, 'gi');
+    out = out.replace(re, '****');
+  }
+  return out;
+}
+
+================================================================================
+apps/api/src/modules/messaging/youth-safety.guard.ts
+================================================================================
+import { CanActivate, ExecutionContext, ForbiddenException, Injectable } from '@nestjs/common';
+import { PrismaService } from '../../prisma/prisma.service';
+
+@Injectable()
+export class YouthSafetyGuard implements CanActivate {
+  constructor(private prisma: PrismaService) {}
+
+  async canActivate(ctx: ExecutionContext): Promise<boolean> {
+    const req = ctx.switchToHttp().getRequest();
+    const dto = req.body as { senderId: string; recipientId?: string; conversationId?: string; content?: string };
+    const sender = await this.prisma.user.findUnique({ where: { id: dto.senderId } });
+    if (!sender) throw new ForbiddenException('Unknown user');
+
+    if (sender.ageMode === 'YOUTH') {
+      // Only allow messaging with verified employers or existing accepted contacts
+      // Determine recipient
+      let recipientId = dto.recipientId;
+      if (!recipientId && dto.conversationId) {
+        const conv = await this.prisma.conversation.findUnique({
+          where: { id: dto.conversationId },
+          include: { participants: true },
+        });
+        const other = conv?.participants.find((p) => p.userId !== sender.id);
+        recipientId = other?.userId;
+      }
+      if (!recipientId) return false;
+
+      const recipient = await this.prisma.user.findUnique({ where: { id: recipientId } });
+      const verifiedEmployer = recipient?.isEmployerVerified === true;
+
+      const contact = await this.prisma.contact.findFirst({
+        where: { userId: sender.id, contactUserId: recipientId, status: 'ACCEPTED' },
+      });
+
+      if (!(verifiedEmployer || contact)) {
+        throw new ForbiddenException('Youth safety: messaging restricted to verified employers or contacts.');
+      }
+    }
+    return true;
+  }
+}
+
+================================================================================
+apps/api/src/modules/messaging/rate-limit.guard.ts
+================================================================================
+import { CanActivate, ExecutionContext, Injectable, TooManyRequestsException } from '@nestjs/common';
+
+// In-memory token bucket placeholder. Replace with Redis in prod.
+const WINDOW_MS = 10_000;
+const MAX_CALLS = 15;
+const buckets = new Map<string, { ts: number; count: number }>();
+
+@Injectable()
+export class RateLimitGuard implements CanActivate {
+  canActivate(ctx: ExecutionContext): boolean {
+    const req = ctx.switchToHttp().getRequest();
+    const key = `${req.path}:${req.body?.senderId ?? req.query?.userId ?? 'anon'}`;
+    const now = Date.now();
+    const b = buckets.get(key);
+    if (!b || now - b.ts > WINDOW_MS) {
+      buckets.set(key, { ts: now, count: 1 });
+      return true;
+    }
+    if (b.count >= MAX_CALLS) throw new TooManyRequestsException('Slow down');
+    b.count += 1;
+    return true;
+  }
+}
+
+================================================================================
+apps/api/src/modules/notifications/notifications.module.ts
+================================================================================
+import { Module } from '@nestjs/common';
+import { NotificationsService } from './notifications.service';
+import { NotificationsController } from './notifications.controller';
+import { PrismaService } from '../../prisma/prisma.service';
+
+@Module({
+  controllers: [NotificationsController],
+  providers: [NotificationsService, PrismaService],
+  exports: [NotificationsService],
+})
+export class NotificationsModule {}
+
+================================================================================
+apps/api/src/modules/notifications/notifications.controller.ts
+================================================================================
+import { Controller, Get, Post, Body, Query } from '@nestjs/common';
+import { NotificationsService } from './notifications.service';
+
+@Controller('notifications')
+export class NotificationsController {
+  constructor(private readonly notifications: NotificationsService) {}
+
+  @Get()
+  async list(@Query('userId') userId: string, @Query('unseen') unseen?: string) {
+    return this.notifications.list(userId, unseen === 'true');
+  }
+
+  @Post('seen')
+  async markSeen(@Body() body: { userId: string; ids?: string[] }) {
+    return this.notifications.markSeen(body.userId, body.ids);
+  }
+}
+
+================================================================================
+apps/api/src/modules/notifications/notifications.service.ts
+================================================================================
+import { Injectable } from '@nestjs/common';
+import { PrismaService } from '../../prisma/prisma.service';
+
+export type NotificationCreate = {
+  userId: string;
+  type: 'MESSAGE' | 'MENTION' | 'CONNECTION' | 'JOB_ALERT' | 'SYSTEM';
+  title: string;
+  body?: string | null;
+  data?: Record<string, any> | null;
+};
+
+@Injectable()
+export class NotificationsService {
+  constructor(private prisma: PrismaService) {}
+
+  async create(input: NotificationCreate) {
+    return this.prisma.notification.create({ data: input });
+  }
+
+  async list(userId: string, unseenOnly = false) {
+    return this.prisma.notification.findMany({
+      where: { userId, ...(unseenOnly ? { seenAt: null } : {}) },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    });
+  }
+
+  async markSeen(userId: string, ids?: string[]) {
+    if (ids?.length) {
+      await this.prisma.notification.updateMany({
+        where: { userId, id: { in: ids } },
+        data: { seenAt: new Date() },
+      });
+      return { ok: true, count: ids.length };
+    }
+    const res = await this.prisma.notification.updateMany({
+      where: { userId, seenAt: null },
+      data: { seenAt: new Date() },
+    });
+    return { ok: true, count: res.count };
+  }
+}
+
+================================================================================
+prisma/schema.prisma (append patch)
+================================================================================
+// --- Messaging ---
+model Conversation {
+  id             String                    @id @default(cuid())
+  title          String?
+  isGroup        Boolean                   @default(false)
+  participants   ConversationParticipant[]
+  messages       Message[]
+  lastMessage    Message?                  @relation("LastMessage", fields: [lastMessageId], references: [id])
+  lastMessageId  String?
+  updatedAt      DateTime                  @updatedAt
+  createdAt      DateTime                  @default(now())
+}
+
+model ConversationParticipant {
+  id               String      @id @default(cuid())
+  conversation     Conversation @relation(fields: [conversationId], references: [id])
+  conversationId   String
+  user             User        @relation(fields: [userId], references: [id])
+  userId           String
+  lastReadMessage  Message?    @relation(fields: [lastReadMessageId], references: [id])
+  lastReadMessageId String?
+  lastReadAt       DateTime?
+}
+
+model Message {
+  id             String        @id @default(cuid())
+  conversation   Conversation  @relation(fields: [conversationId], references: [id])
+  conversationId String
+  sender         User          @relation(fields: [senderId], references: [id])
+  senderId       String
+  content        String?
+  attachmentUrl  String?
+  meta           Json?
+  createdAt      DateTime      @default(now())
+  // for lastMessage relation
+  ConversationLastMessage Conversation[] @relation("LastMessage")
+}
+
+model Block {
+  userId       String
+  targetUserId String
+  createdAt    DateTime @default(now())
+  @@id([userId, targetUserId])
+}
+
+model Report {
+  id           String   @id @default(cuid())
+  reporter     User     @relation("Reporter", fields: [reporterId], references: [id])
+  reporterId   String
+  targetUser   User     @relation("Target", fields: [targetUserId], references: [id])
+  targetUserId String
+  reason       String
+  createdAt    DateTime @default(now())
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    String
+  type      String
+  title     String
+  body      String?
+  data      Json?
+  seenAt    DateTime?
+  createdAt DateTime @default(now())
+}
+
+// --- Minimal additions to User for safety flags ---
+model User {
+  id                 String    @id @default(cuid())
+  fullName           String?
+  email              String?   @unique
+  ageMode            String?   // 'YOUTH' | 'ADULT'
+  isEmployerVerified Boolean   @default(false)
+  // relations
+  messages           Message[]
+  notifications      Notification[]
+  // Contact list for youth safety
+  contacts           Contact[]
+}
+
+model Contact {
+  id            String  @id @default(cuid())
+  user          User    @relation(fields: [userId], references: [id])
+  userId        String
+  contactUser   User    @relation(fields: [contactUserId], references: [id])
+  contactUserId String
+  status        String  // 'PENDING' | 'ACCEPTED' | 'BLOCKED'
+  createdAt     DateTime @default(now())
+}
+
+================================================================================
+apps/web/src/types/messaging.ts
+================================================================================
+export type Conversation = {
+  id: string;
+  title?: string | null;
+  isGroup: boolean;
+  updatedAt: string;
+  lastMessage?: Message | null;
+  participants: { id: string; userId: string }[];
+};
+
+export type Message = {
+  id: string;
+  conversationId: string;
+  senderId: string;
+  content?: string;
+  attachmentUrl?: string | null;
+  createdAt: string;
+};
+
+export type Notification = {
+  id: string;
+  type: 'MESSAGE' | 'MENTION' | 'CONNECTION' | 'JOB_ALERT' | 'SYSTEM';
+  title: string;
+  body?: string;
+  data?: Record<string, any>;
+  seenAt?: string | null;
+  createdAt: string;
+};
+
+================================================================================
+apps/web/src/api/messaging.ts
+================================================================================
+import axios from 'axios';
+import { Conversation, Message, Notification } from '@/types/messaging';
+
+const API = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+
+export const MessagingAPI = {
+  async listConversations(userId: string, page = 1, limit = 20) {
+    const { data } = await axios.get(`${API}/messaging/conversations`, { params: { userId, page, limit } });
+    return data as { items: Conversation[]; total: number; page: number; limit: number };
+  },
+  async getConversation(userId: string, id: string) {
+    const { data } = await axios.get(`${API}/messaging/conversations/${id}`, { params: { userId } });
+    return data as Conversation;
+  },
+  async listMessages(userId: string, conversationId: string, page = 1, limit = 50) {
+    const { data } = await axios.get(`${API}/messaging/conversations/${conversationId}/messages`, { params: { userId, page, limit } });
+    return data as { items: Message[]; total: number; page: number; limit: number };
+  },
+  async createConversation(creatorId: string, participantIds: string[], title?: string) {
+    const { data } = await axios.post(`${API}/messaging/conversations`, { creatorId, participantIds, title });
+    return data as Conversation;
+  },
+  async sendMessage(input: { senderId: string; recipientId?: string; conversationId?: string; content?: string }) {
+    const { data } = await axios.post(`${API}/messaging/messages`, input);
+    return data as Message;
+  },
+  async markRead(userId: string, conversationId: string, messageId?: string) {
+    const { data } = await axios.post(`${API}/messaging/messages/read`, { userId, conversationId, messageId });
+    return data;
+  },
+};
+
+export const NotificationsAPI = {
+  async list(userId: string, unseen = false) {
+    const { data } = await axios.get(`${API}/notifications`, { params: { userId, unseen } });
+    return data as Notification[];
+  },
+  async markSeen(userId: string, ids?: string[]) {
+    const { data } = await axios.post(`${API}/notifications/seen`, { userId, ids });
+    return data as { ok: true; count: number };
+  },
+};
+
+================================================================================
+apps/web/src/hooks/useChatSocket.ts
+================================================================================
+import { useEffect, useRef, useState } from 'react';
+import { io, Socket } from 'socket.io-client';
+import { Message } from '@/types/messaging';
+
+export function useChatSocket(userId: string | undefined) {
+  const socketRef = useRef<Socket | null>(null);
+  const [online, setOnline] = useState(false);
+
+  useEffect(() => {
+    if (!userId) return;
+    const url = import.meta.env.VITE_SOCKET_URL || import.meta.env.VITE_API_URL || 'http://localhost:3000';
+    const socket = io(url, { query: { userId } });
+    socketRef.current = socket;
+
+    socket.on('connect', () => setOnline(true));
+    socket.on('disconnect', () => setOnline(false));
+
+    return () => { socket.disconnect(); socketRef.current = null; };
+  }, [userId]);
+
+  function onMessage(cb: (msg: Message) => void) {
+    socketRef.current?.on('message:new', cb);
+    return () => socketRef.current?.off('message:new', cb);
+  }
+
+  function onTyping(cb: (payload: { conversationId: string; userId: string; typing: boolean }) => void) {
+    socketRef.current?.on('typing', cb);
+    return () => socketRef.current?.off('typing', cb);
+  }
+
+  function onRead(cb: (payload: { conversationId: string; userId: string; messageId?: string }) => void) {
+    socketRef.current?.on('message:read', cb);
+    return () => socketRef.current?.off('message:read', cb);
+  }
+
+  function emitTyping(payload: { conversationId: string; typing: boolean }) {
+    socketRef.current?.emit('typing', payload);
+  }
+
+  return { socket: socketRef.current, online, onMessage, onTyping, onRead, emitTyping };
+}
+
+================================================================================
+apps/web/src/components/chat/ConversationList.tsx
+================================================================================
+import React from 'react';
+import { Conversation } from '@/types/messaging';
+import { Card } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
+
+type Props = {
+  conversations: Conversation[];
+  activeId?: string;
+  onSelect: (conv: Conversation) => void;
+};
+
+export default function ConversationList({ conversations, activeId, onSelect }: Props) {
+  return (
+    <div className="space-y-2">
+      {conversations.map((c) => (
+        <Card
+          key={c.id}
+          onClick={() => onSelect(c)}
+          className={`p-3 cursor-pointer border ${activeId === c.id ? 'border-indigo-400 bg-indigo-50' : 'border-gray-200 bg-white/90'}`}
+        >
+          <div className="flex items-center justify-between">
+            <div className="font-medium text-gray-900 truncate">{c.title ?? 'Conversation'}</div>
+            {c.lastMessage && <Badge variant="secondary" className="text-xs">{new Date(c.updatedAt).toLocaleTimeString()}</Badge>}
+          </div>
+          <div className="text-gray-600 text-sm truncate">
+            {c.lastMessage?.content ?? 'No messages yet'}
+          </div>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+================================================================================
+apps/web/src/components/chat/ChatWindow.tsx
+================================================================================
+import React, { useEffect, useRef, useState } from 'react';
+import { Message } from '@/types/messaging';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Badge } from '@/components/ui/badge';
+
+type Props = {
+  userId: string;
+  conversationId: string;
+  onSend: (text: string) => Promise<void>;
+  onTyping: (typing: boolean) => void;
+  initialMessages: Message[];
+  youthSafe?: boolean;
+};
+
+export default function ChatWindow({ userId, conversationId, onSend, onTyping, initialMessages, youthSafe }: Props) {
+  const [messages, setMessages] = useState<Message[]>(initialMessages);
+  const [text, setText] = useState('');
+  const [typing, setTyping] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+  }, [messages.length]);
+
+  useEffect(() => {
+    const t = setTimeout(() => {
+      if (typing) onTyping(true);
+    }, 150);
+    return () => clearTimeout(t);
+  }, [typing]);
+
+  async function handleSend() {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    await onSend(trimmed);
+    setText('');
+  }
+
+  return (
+    <div className="flex flex-col h-full bg-white/90 border rounded-xl">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-3">
+        {messages.map((m) => (
+          <div key={m.id} className={`max-w-[70%] ${m.senderId === userId ? 'ml-auto text-right' : ''}`}>
+            <div className={`inline-block px-3 py-2 rounded-lg ${m.senderId === userId ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-900'}`}>
+              {m.content}
+            </div>
+            <div className="text-[10px] text-gray-500 mt-1">{new Date(m.createdAt).toLocaleString()}</div>
+          </div>
+        ))}
+      </div>
+      {youthSafe && (
+        <div className="px-4 pb-2">
+          <Badge className="bg-emerald-100 text-emerald-800 border-emerald-200">Youth‑Safe: No sharing addresses or in‑person meetups</Badge>
+        </div>
+      )}
+      <div className="p-3 border-t flex gap-2">
+        <Input
+          value={text}
+          onChange={(e) => { setText(e.target.value); setTyping(true); }}
+          onBlur={() => onTyping(false)}
+          placeholder="Type a message…"
+          onKeyDown={(e) => { if (e.key === 'Enter') handleSend(); }}
+        />
+        <Button onClick={handleSend}>Send</Button>
+      </div>
+    </div>
+  );
+}
+
+================================================================================
+apps/web/src/pages/Messages.tsx
+================================================================================
+import React, { useEffect, useMemo, useState } from 'react';
+import { MessagingAPI, NotificationsAPI } from '@/api/messaging';
+import { Conversation, Message as Msg } from '@/types/messaging';
+import ConversationList from '@/components/chat/ConversationList';
+import ChatWindow from '@/components/chat/ChatWindow';
+import { useChatSocket } from '@/hooks/useChatSocket';
+import { Card } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { BellIcon, SparklesIcon } from 'lucide-react';
+import { User } from '@/entities/all';
+
+export default function MessagesPage() {
+  const [user, setUser] = useState<any>(null);
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [active, setActive] = useState<Conversation | null>(null);
+  const [messages, setMessages] = useState<Msg[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      const me = await User.me();
+      setUser(me);
+      const convs = await MessagingAPI.listConversations(me.id, 1, 50);
+      setConversations(convs.items);
+      setActive(convs.items[0] ?? null);
+      setLoading(false);
+    })();
+  }, []);
+
+  const { online, onMessage, onTyping, onRead, emitTyping } = useChatSocket(user?.id);
+
+  useEffect(() => {
+    if (!user?.id) return;
+    const off1 = onMessage(async (m) => {
+      if (m.conversationId === active?.id) {
+        setMessages((prev) => [...prev, m]);
+        await MessagingAPI.markRead(user.id, m.conversationId, m.id);
+      }
+    });
+    const off2 = onTyping(() => {});
+    const off3 = onRead(() => {});
+    return () => { off1?.(); off2?.(); off3?.(); };
+  }, [user?.id, active?.id]);
+
+  useEffect(() => {
+    (async () => {
+      if (!user?.id || !active?.id) return;
+      const res = await MessagingAPI.listMessages(user.id, active.id, 1, 50);
+      setMessages(res.items);
+      await MessagingAPI.markRead(user.id, active.id, res.items[res.items.length - 1]?.id);
+    })();
+  }, [user?.id, active?.id]);
+
+  async function handleSend(text: string) {
+    if (!user?.id || !active?.id) return;
+    const m = await MessagingAPI.sendMessage({ senderId: user.id, conversationId: active.id, content: text });
+    setMessages((prev) => [...prev, m]);
+  }
+
+  const youthSafe = useMemo(() => user?.age_mode === 'YOUTH' || user?.ageMode === 'YOUTH', [user]);
+
+  if (loading) return <div className="p-6">Loading…</div>;
+
+  return (
+    <div className="p-6 md:p-8 max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-6">
+      <div className="md:col-span-1">
+        <Card className="p-3 mb-3 flex items-center justify-between">
+          <div className="text-sm text-gray-600">Socket: {online ? 'Online' : 'Offline'}</div>
+          <Button size="sm" variant="outline" onClick={async () => {
+            const unseen = await NotificationsAPI.list(user.id, true);
+            if (unseen.length) await NotificationsAPI.markSeen(user.id, unseen.map(n => n.id));
+          }}>
+            <BellIcon className="w-4 h-4 mr-1" /> Notifications
+          </Button>
+        </Card>
+        <ConversationList
+          conversations={conversations}
+          activeId={active?.id}
+          onSelect={(c) => setActive(c)}
+        />
+      </div>
+      <div className="md:col-span-2 h-[70vh]">
+        {active ? (
+          <ChatWindow
+            userId={user.id}
+            conversationId={active.id}
+            initialMessages={messages}
+            onTyping={(t) => emitTyping({ conversationId: active.id, typing: t })}
+            onSend={handleSend}
+            youthSafe={youthSafe}
+          />
+        ) : (
+          <Card className="p-8 h-full flex flex-col items-center justify-center text-center">
+            <SparklesIcon className="w-10 h-10 text-indigo-500 mb-3" />
+            <div className="text-gray-700 font-medium">No conversations yet</div>
+            <div className="text-sm text-gray-500">Start by connecting with a verified employer or a classmate.</div>
+          </Card>
+        )}
+      </div>
+    </div>
+  );
+}
+
+================================================================================
+packages/contracts/src/messaging.ts
+================================================================================
+export type SocketEvents =
+  | { name: 'message:new'; payload: any }
+  | { name: 'message:read'; payload: { conversationId: string; userId: string; messageId?: string } }
+  | { name: 'typing'; payload: { conversationId: string; userId: string; typing: boolean } }
+  | { name: 'conversation:created'; payload: any };
+
+export const SOCKET_PATH = '/socket.io';
+
+================================================================================
+apps/api/test/messaging.e2e-spec.ts
+================================================================================
+import { Test, TestingModule } from '@nestjs/testing';
+import { MessagingService } from '../src/modules/messaging/messaging.service';
+
+describe('MessagingService (smoke)', () => {
+  it('sanitize + create minimal message payload', async () => {
+    const svc = { sendMessage: async (dto: any) => ({ ...dto, id: 'm_1', content: dto.content?.replace(/badword1/gi, '****') }) } as any as MessagingService;
+    const res = await svc.sendMessage({ senderId: 'u1', recipientId: 'u2', content: 'hello badword1' } as any);
+    expect(res.content).toContain('****');
+  });
+});
+
+================================================================================
+apps/web/src/env.d.ts (ensure these exist)
+================================================================================
+interface ImportMetaEnv {
+  readonly VITE_API_URL?: string;
+  readonly VITE_SOCKET_URL?: string;
+}
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+
+================================================================================
+README-Messaging.md
+================================================================================
+# Messaging + Notifications (Bundle 06)
+
+## What this adds
+- Realtime chat via Socket.IO (NestJS gateway)
+- 1:1 + group conversations, read receipts, typing indicators
+- Youth safety guard: under‑18 users can only message verified employers or accepted contacts
+- Profanity sanitization placeholder
+- In‑app notifications for new messages
+- Minimal API routes for conversations, messages, read receipts, block/report
+
+## Setup
+1) Apply Prisma patch:
+```
+npx prisma migrate dev -n "bundle_06_messaging"
+```
+2) Env (no secrets included):
+```
+SOCKET_CORS_ORIGIN=http://localhost:5173
+SOCKET_PATH=/socket.io
+```
+3) Start API and Web with your normal dev commands.
+
+## Frontend usage
+- Ensure `VITE_API_URL` and (optionally) `VITE_SOCKET_URL` point to API host.
+- Navigate to `/messages` page to try chat.
+
+## Notes
+- Authentication is placeholder; wire to your existing auth/guards.
+- Replace profanity + rate limit with robust services in prod.
+- Notifications are in-app only here; add Web Push later if desired.
+

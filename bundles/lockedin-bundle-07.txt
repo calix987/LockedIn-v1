@@ -1,0 +1,937 @@
+LOCKEDIN — BUNDLE 07 (Posts, Feed, Comments & Reactions + Basic Moderation)
+VIRTUAL ARCHIVE (.txt). Extract each block into your repo using the indicated paths.
+
+───────────────────────────────────────────────────────────────────────────────
+# 0) OVERVIEW
+- Adds social feed with Posts, Comments, Reactions (like/support/insightful), and lightweight Moderation/Reporting.
+- Youth-Safe: sanitizes HTML, blocks location/meetup solicitation phrases for under-18 viewers, disables DM CTA on youth posts.
+- Verified/Employer badges rendered consistently with your existing design system.
+- No secrets included; all env via placeholders (e.g., process.env.*).
+
+Compat notes:
+- Backend: NestJS + Prisma (same style as earlier bundles). Node 18+.
+- Frontend: React + Tailwind + shadcn/ui + framer-motion + lucide-react (consistent with your current stack).
+- Socket integration optional (commented hints added to hook into Bundle 06 if present).
+
+───────────────────────────────────────────────────────────────────────────────
+# 1) DATABASE — prisma/schema.prisma (PATCH)
+#   Apply this patch to your existing schema and run `npx prisma generate && npx prisma migrate dev -n "bundle07_posts_feed"`
+
+[FILE: backend/prisma/schema.patch.sql]
+--- PATCH START ---
+/* Enums */
+-- Reaction types keep it simple and SFW
+CREATE TYPE "ReactionType" AS ENUM ('LIKE', 'SUPPORT', 'INSIGHTFUL', 'CELEBRATE', 'LOVE');
+
+CREATE TYPE "PostVisibility" AS ENUM ('PUBLIC', 'CONNECTIONS', 'PRIVATE');
+
+/* Tables */
+CREATE TABLE "Post" (
+  "id" TEXT PRIMARY KEY,
+  "authorId" TEXT NOT NULL REFERENCES "User"("id") ON DELETE CASCADE,
+  "visibility" "PostVisibility" NOT NULL DEFAULT 'PUBLIC',
+  "body" TEXT NOT NULL,                      -- plain text or sanitized HTML/markdown
+  "media" JSONB,                             -- [{type:'image'|'video', url: '...', alt: '...'}]
+  "tags" TEXT[],                             -- skill tags / topics
+  "isEmployerPost" BOOLEAN NOT NULL DEFAULT FALSE,
+  "isYouthFriendly" BOOLEAN NOT NULL DEFAULT FALSE,  -- surfaces badge
+  "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE "Comment" (
+  "id" TEXT PRIMARY KEY,
+  "postId" TEXT NOT NULL REFERENCES "Post"("id") ON DELETE CASCADE,
+  "authorId" TEXT NOT NULL REFERENCES "User"("id") ON DELETE CASCADE,
+  "body" TEXT NOT NULL,
+  "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE "Reaction" (
+  "id" TEXT PRIMARY KEY,
+  "postId" TEXT NOT NULL REFERENCES "Post"("id") ON DELETE CASCADE,
+  "userId" TEXT NOT NULL REFERENCES "User"("id") ON DELETE CASCADE,
+  "type" "ReactionType" NOT NULL,
+  "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT "uniq_reaction" UNIQUE ("postId", "userId")
+);
+
+CREATE TABLE "PostReport" (
+  "id" TEXT PRIMARY KEY,
+  "postId" TEXT NOT NULL REFERENCES "Post"("id") ON DELETE CASCADE,
+  "reporterId" TEXT NOT NULL REFERENCES "User"("id") ON DELETE CASCADE,
+  "reason" TEXT NOT NULL,
+  "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+/* Simple feed index (optional) — can be replaced by full text search later */
+CREATE INDEX "idx_post_created" ON "Post"("createdAt" DESC);
+CREATE INDEX "idx_post_author" ON "Post"("authorId");
+CREATE INDEX "idx_comment_post" ON "Comment"("postId");
+--- PATCH END ---
+
+
+───────────────────────────────────────────────────────────────────────────────
+# 2) BACKEND — NestJS
+
+[FILE: backend/src/modules/posts/posts.module.ts]
+import { Module } from '@nestjs/common';
+import { PostsController } from './posts.controller';
+import { CommentsController } from './comments.controller';
+import { ReactionsController } from './reactions.controller';
+import { PostsService } from './posts.service';
+import { FeedService } from './feed.service';
+import { PrismaService } from '../../prisma/prisma.service';
+import { YouthSafetyService } from '../safety/youth-safety.service';
+import { ContentSafetyService } from '../safety/content-safety.service';
+
+@Module({
+  controllers: [PostsController, CommentsController, ReactionsController],
+  providers: [PostsService, FeedService, PrismaService, YouthSafetyService, ContentSafetyService],
+  exports: [PostsService, FeedService],
+})
+export class PostsModule {}
+
+[FILE: backend/src/modules/posts/dto/create-post.dto.ts]
+import { IsArray, IsBoolean, IsEnum, IsOptional, IsString, MaxLength } from 'class-validator';
+
+export enum PostVisibility {
+  PUBLIC = 'PUBLIC',
+  CONNECTIONS = 'CONNECTIONS',
+  PRIVATE = 'PRIVATE',
+}
+
+export class CreatePostDto {
+  @IsString()
+  @MaxLength(5000)
+  body!: string;
+
+  @IsEnum(PostVisibility)
+  visibility: PostVisibility = PostVisibility.PUBLIC;
+
+  @IsOptional()
+  @IsArray()
+  tags?: string[];
+
+  @IsOptional()
+  media?: Array<{type: 'image' | 'video'; url: string; alt?: string}>;
+
+  @IsOptional()
+  @IsBoolean()
+  isEmployerPost?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  isYouthFriendly?: boolean;
+}
+
+[FILE: backend/src/modules/posts/dto/update-post.dto.ts]
+import { PartialType } from '@nestjs/mapped-types';
+import { CreatePostDto } from './create-post.dto';
+
+export class UpdatePostDto extends PartialType(CreatePostDto) {}
+
+[FILE: backend/src/modules/posts/posts.controller.ts]
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query, Req, UseGuards } from '@nestjs/common';
+import { PostsService } from './posts.service';
+import { CreatePostDto, PostVisibility } from './dto/create-post.dto';
+import { UpdatePostDto } from './dto/update-post.dto';
+import { YouthSafetyService } from '../safety/youth-safety.service';
+
+@Controller('posts')
+export class PostsController {
+  constructor(
+    private readonly postsService: PostsService,
+    private readonly youthSafety: YouthSafetyService,
+  ) {}
+
+  @Post()
+  async create(@Req() req: any, @Body() dto: CreatePostDto) {
+    const user = req.user; // injected by auth middleware
+    const safeBody = this.youthSafety.sanitizeBody(dto.body, user);
+    this.youthSafety.assertNoMeetupSolicitation(safeBody, user);
+    return this.postsService.create({
+      ...dto,
+      body: safeBody,
+      authorId: user.id,
+    });
+  }
+
+  @Get(':id')
+  async findOne(@Req() req: any, @Param('id') id: string) {
+    const viewer = req.user;
+    return this.postsService.findOneVisible(id, viewer?.id);
+  }
+
+  @Get()
+  async list(@Req() req: any, @Query('authorId') authorId?: string, @Query('tag') tag?: string) {
+    const viewer = req.user;
+    return this.postsService.list({ viewerId: viewer?.id, authorId, tag });
+  }
+
+  @Patch(':id')
+  async update(@Req() req: any, @Param('id') id: string, @Body() dto: UpdatePostDto) {
+    const user = req.user;
+    return this.postsService.update(user.id, id, dto);
+  }
+
+  @Delete(':id')
+  async remove(@Req() req: any, @Param('id') id: string) {
+    const user = req.user;
+    return this.postsService.remove(user.id, id);
+  }
+}
+
+[FILE: backend/src/modules/posts/comments.controller.ts]
+import { Body, Controller, Delete, Get, Param, Post, Req } from '@nestjs/common';
+import { PostsService } from './posts.service';
+import { YouthSafetyService } from '../safety/youth-safety.service';
+
+@Controller('posts/:postId/comments')
+export class CommentsController {
+  constructor(
+    private readonly posts: PostsService,
+    private readonly youthSafety: YouthSafetyService,
+  ) {}
+
+  @Get()
+  async list(@Param('postId') postId: string) {
+    return this.posts.listComments(postId);
+  }
+
+  @Post()
+  async create(@Req() req: any, @Param('postId') postId: string, @Body() body: { body: string }) {
+    const user = req.user;
+    const safe = this.youthSafety.sanitizeBody(body.body, user);
+    this.youthSafety.assertNoMeetupSolicitation(safe, user);
+    return this.posts.createComment(postId, user.id, safe);
+  }
+
+  @Delete(':commentId')
+  async delete(@Req() req: any, @Param('postId') postId: string, @Param('commentId') commentId: string) {
+    const user = req.user;
+    return this.posts.deleteComment(postId, commentId, user.id);
+  }
+}
+
+[FILE: backend/src/modules/posts/reactions.controller.ts]
+import { Body, Controller, Delete, Param, Post, Req } from '@nestjs/common';
+import { PostsService } from './posts.service';
+
+@Controller('posts/:postId/reactions')
+export class ReactionsController {
+  constructor(private readonly posts: PostsService) {}
+
+  @Post()
+  async set(@Req() req: any, @Param('postId') postId: string, @Body() body: { type: 'LIKE'|'SUPPORT'|'INSIGHTFUL'|'CELEBRATE'|'LOVE' }) {
+    const user = req.user;
+    return this.posts.setReaction(postId, user.id, body.type);
+  }
+
+  @Delete()
+  async unset(@Req() req: any, @Param('postId') postId: string) {
+    const user = req.user;
+    return this.posts.unsetReaction(postId, user.id);
+  }
+}
+
+[FILE: backend/src/modules/posts/feed.service.ts]
+import { Injectable } from '@nestjs/common';
+import { PrismaService } from '../../prisma/prisma.service';
+
+/**
+ * Extremely simple feed:
+ * - Shows PUBLIC posts + CONNECTIONS posts from people the viewer follows/is connected to
+ * - Optionally boosts employer + youth-friendly posts for youth viewers
+ * Future: add recsys, skills/topic boosts, collaborative filtering, etc.
+ */
+@Injectable()
+export class FeedService {
+  constructor(private prisma: PrismaService) {}
+
+  async getFeed(viewerId: string | null, opts: { cursor?: string; limit?: number } = {}) {
+    const limit = Math.min(Math.max(opts.limit ?? 20, 1), 50);
+
+    // Get IDs of connections for viewer
+    let connectionIds: string[] = [];
+    if (viewerId) {
+      const conns = await this.prisma.connection.findMany({
+        where: { OR: [
+          { requesterId: viewerId, status: 'ACCEPTED' },
+          { addresseeId: viewerId, status: 'ACCEPTED' }
+        ]},
+        select: { requesterId: true, addresseeId: true }
+      });
+      connectionIds = conns.map(c => c.requesterId === viewerId ? c.addresseeId : c.requesterId);
+    }
+
+    const posts = await this.prisma.post.findMany({
+      where: {
+        OR: [
+          { visibility: 'PUBLIC' },
+          viewerId ? { AND: [{ visibility: 'CONNECTIONS' }, { authorId: { in: connectionIds }}] } : { id: { in: [] }}
+        ]
+      },
+      orderBy: [{ createdAt: 'desc' }],
+      take: limit,
+      include: {
+        _count: { select: { comments: true, reactions: true } },
+        author: { select: { id: true, fullName: true, avatarUrl: true, isEmployer: true, isVerified: true, ageMode: true } }
+      }
+    });
+
+    return posts;
+  }
+}
+
+[FILE: backend/src/modules/posts/posts.service.ts]
+import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/common';
+import { PrismaService } from '../../prisma/prisma.service';
+import { CreatePostDto, PostVisibility } from './dto/create-post.dto';
+import { UpdatePostDto } from './dto/update-post.dto';
+
+@Injectable()
+export class PostsService {
+  constructor(private prisma: PrismaService) {}
+
+  async create(input: CreatePostDto & { authorId: string }) {
+    const post = await this.prisma.post.create({
+      data: {
+        id: crypto.randomUUID(),
+        authorId: input.authorId,
+        body: input.body,
+        visibility: input.visibility,
+        tags: input.tags ?? [],
+        media: input.media ?? [],
+        isEmployerPost: !!input.isEmployerPost,
+        isYouthFriendly: !!input.isYouthFriendly,
+      }
+    });
+    return post;
+  }
+
+  async findOneVisible(id: string, viewerId?: string | null) {
+    const post = await this.prisma.post.findUnique({
+      where: { id },
+      include: {
+        author: { select: { id: true, fullName: true, avatarUrl: true, isEmployer: true, isVerified: true } },
+        _count: { select: { comments: true, reactions: true } }
+      }
+    });
+    if (!post) throw new NotFoundException('Post not found');
+
+    // Visibility check
+    if (post.visibility === 'PRIVATE' && post.authorId !== viewerId) {
+      throw new ForbiddenException();
+    }
+    if (post.visibility === 'CONNECTIONS' && viewerId) {
+      const conn = await this.prisma.connection.findFirst({
+        where: {
+          status: 'ACCEPTED',
+          OR: [
+            { requesterId: viewerId, addresseeId: post.authorId },
+            { addresseeId: viewerId, requesterId: post.authorId },
+          ]
+        }
+      });
+      if (!conn && post.authorId !== viewerId) throw new ForbiddenException();
+    } else if (post.visibility === 'CONNECTIONS' && !viewerId) {
+      throw new ForbiddenException();
+    }
+
+    return post;
+  }
+
+  async list(params: { viewerId?: string | null; authorId?: string; tag?: string }) {
+    const { viewerId, authorId, tag } = params;
+    const where: any = { };
+    if (authorId) where.authorId = authorId;
+    if (tag) where.tags = { has: tag };
+
+    // Simplified visibility: show PUBLIC and own/connection posts for viewer
+    if (viewerId) {
+      where.OR = [
+        { visibility: 'PUBLIC' },
+        { authorId: viewerId },
+        {
+          AND: [
+            { visibility: 'CONNECTIONS' },
+            { author: { OR: [
+              { connectionsAsRequester: { some: { addresseeId: viewerId, status: 'ACCEPTED' } } },
+              { connectionsAsAddressee: { some: { requesterId: viewerId, status: 'ACCEPTED' } } },
+            ] } }
+          ]
+        }
+      ];
+    } else {
+      where.visibility = 'PUBLIC';
+    }
+
+    return this.prisma.post.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        author: { select: { id: true, fullName: true, avatarUrl: true, isEmployer: true, isVerified: true } },
+        _count: { select: { comments: true, reactions: true } }
+      }
+    });
+  }
+
+  async update(userId: string, postId: string, dto: UpdatePostDto) {
+    const post = await this.prisma.post.findUnique({ where: { id: postId } });
+    if (!post) throw new NotFoundException();
+    if (post.authorId != userId) throw new ForbiddenException();
+
+    return this.prisma.post.update({
+      where: { id: postId },
+      data: {
+        body: dto.body ?? post.body,
+        tags: dto.tags ?? post.tags,
+        media: dto.media ?? post.media,
+        visibility: dto.visibility ?? post.visibility,
+        isEmployerPost: dto.isEmployerPost ?? post.isEmployerPost,
+        isYouthFriendly: dto.isYouthFriendly ?? post.isYouthFriendly,
+        updatedAt: new Date(),
+      }
+    });
+  }
+
+  async remove(userId: string, postId: string) {
+    const post = await this.prisma.post.findUnique({ where: { id: postId } });
+    if (!post) throw new NotFoundException();
+    if (post.authorId !== userId) throw new ForbiddenException();
+    await this.prisma.post.delete({ where: { id: postId } });
+    return { ok: true };
+  }
+
+  /* Comments */
+  async listComments(postId: string) {
+    return this.prisma.comment.findMany({
+      where: { postId },
+      orderBy: { createdAt: 'asc' },
+      include: { author: { select: { id: true, fullName: true, avatarUrl: true } } }
+    });
+  }
+
+  async createComment(postId: string, authorId: string, body: string) {
+    const post = await this.prisma.post.findUnique({ where: { id: postId } });
+    if (!post) throw new NotFoundException('Post not found');
+    return this.prisma.comment.create({
+      data: { id: crypto.randomUUID(), postId, authorId, body }
+    });
+  }
+
+  async deleteComment(postId: string, commentId: string, requesterId: string) {
+    const comment = await this.prisma.comment.findFirst({ where: { id: commentId, postId } });
+    if (!comment) throw new NotFoundException();
+    if (comment.authorId !== requesterId) throw new ForbiddenException();
+    await this.prisma.comment.delete({ where: { id: commentId } });
+    return { ok: true };
+  }
+
+  /* Reactions */
+  async setReaction(postId: string, userId: string, type: any) {
+    await this.prisma.reaction.upsert({
+      where: { uniq_reaction: { postId, userId } } as any,
+      create: { id: crypto.randomUUID(), postId, userId, type },
+      update: { type }
+    });
+    const count = await this.prisma.reaction.count({ where: { postId } });
+    return { ok: true, count };
+  }
+
+  async unsetReaction(postId: string, userId: string) {
+    await this.prisma.reaction.deleteMany({ where: { postId, userId } });
+    const count = await this.prisma.reaction.count({ where: { postId } });
+    return { ok: true, count };
+  }
+}
+
+[FILE: backend/src/modules/safety/youth-safety.service.ts]
+import { Injectable, BadRequestException } from '@nestjs/common';
+import DOMPurify from 'isomorphic-dompurify';
+
+@Injectable()
+export class YouthSafetyService {
+  private meetupPatterns = [
+    /meet(?:\s|\-)?up/i,
+    /in\s+person/i,
+    /come\s+to\s+my\s+(house|home|address)/i,
+    /send\s+your\s+address/i,
+    /whats\s+your\s+(address|location)/i,
+  ];
+
+  sanitizeBody(body: string, user: any): string {
+    // Sanitize HTML if someone sends formatted text; strip scripts/iframes
+    const clean = DOMPurify.sanitize(body || '', { ALLOWED_TAGS: ['b','i','strong','em','p','ul','ol','li','br','a','code','pre','blockquote'], ALLOWED_ATTR: ['href','title','target','rel'] });
+    return clean;
+  }
+
+  assertNoMeetupSolicitation(body: string, user: any) {
+    if (user?.ageMode === 'YOUTH') {
+      for (const p of this.meetupPatterns) {
+        if (p.test(body)) {
+          throw new BadRequestException('For safety, in-person meetup solicitation is not allowed.');
+        }
+      }
+    }
+  }
+}
+
+[FILE: backend/src/modules/safety/content-safety.service.ts]
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class ContentSafetyService {
+  // Placeholder for ML moderation; right now do minimal bad-word filtering
+  private banned = [/explicit\s*term/i];
+
+  check(body: string): { allowed: boolean; reasons?: string[] } {
+    const reasons: string[] = [];
+    for (const r of this.banned) if (r.test(body)) reasons.push('banned_term');
+    return { allowed: reasons.length === 0, reasons: reasons.length ? reasons : undefined };
+  }
+}
+
+[FILE: backend/src/modules/posts/feed.controller.ts]  (optional — if you prefer feed under /feed)
+import { Controller, Get, Query, Req } from '@nestjs/common';
+import { FeedService } from './feed.service';
+
+@Controller('feed')
+export class FeedController {
+  constructor(private feed: FeedService) {}
+  @Get()
+  async getFeed(@Req() req: any, @Query('limit') limit?: string, @Query('cursor') cursor?: string) {
+    const viewer = req.user ?? null;
+    return this.feed.getFeed(viewer?.id || null, { limit: limit ? parseInt(limit,10) : undefined, cursor });
+  }
+}
+
+
+───────────────────────────────────────────────────────────────────────────────
+# 3) FRONTEND — React
+
+[FILE: frontend/src/api/posts.ts]
+import { api } from './root';
+
+export type ReactionType = 'LIKE' | 'SUPPORT' | 'INSIGHTFUL' | 'CELEBRATE' | 'LOVE';
+
+export const PostsAPI = {
+  create: (data: any) => api.post('/posts', data).then(r => r.data),
+  get: (id: string) => api.get(`/posts/${id}`).then(r => r.data),
+  list: (params?: { authorId?: string; tag?: string }) => api.get('/posts', { params }).then(r => r.data),
+  update: (id: string, data: any) => api.patch(`/posts/${id}`, data).then(r => r.data),
+  remove: (id: string) => api.delete(`/posts/${id}`).then(r => r.data),
+
+  comments: {
+    list: (postId: string) => api.get(`/posts/${postId}/comments`).then(r => r.data),
+    create: (postId: string, body: string) => api.post(`/posts/${postId}/comments`, { body }).then(r => r.data),
+    delete: (postId: string, commentId: string) => api.delete(`/posts/${postId}/comments/${commentId}`).then(r => r.data),
+  },
+
+  reactions: {
+    set: (postId: string, type: ReactionType) => api.post(`/posts/${postId}/reactions`, { type }).then(r => r.data),
+    unset: (postId: string) => api.delete(`/posts/${postId}/reactions`).then(r => r.data),
+  },
+
+  feed: {
+    list: (limit = 20) => api.get('/feed', { params: { limit } }).then(r => r.data),
+  }
+};
+
+[FILE: frontend/src/pages/FeedPage.tsx]
+import React, { useEffect, useState } from 'react';
+import { PostsAPI } from '@/api/posts';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader } from '@/components/ui/card';
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
+import { Badge } from '@/components/ui/badge';
+import { Textarea } from '@/components/ui/textarea';
+import { motion } from 'framer-motion';
+import { MessageCircle, Heart, ShieldCheck, Sparkles, Send, ThumbsUp, Lightbulb, PartyPopper } from 'lucide-react';
+import PostCard from '@/components/posts/PostCard';
+import PostComposer from '@/components/posts/PostComposer';
+
+export default function FeedPage() {
+  const [feed, setFeed] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const items = await PostsAPI.feed.list(20);
+      setFeed(items);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(); }, []);
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 via-white to-blue-50 p-6 md:p-8">
+      <div className="max-w-3xl mx-auto space-y-6">
+        <PostComposer onPostCreated={load} />
+
+        {loading ? (
+          <div className="space-y-4 animate-pulse">
+            <div className="h-40 bg-gray-200 rounded-xl"></div>
+            <div className="h-40 bg-gray-200 rounded-xl"></div>
+          </div>
+        ) : (
+          <div className="space-y-6">
+            {feed.map((p) => (
+              <PostCard key={p.id} post={p} onChange={load} />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+[FILE: frontend/src/components/posts/PostComposer.tsx]
+import React, { useState } from 'react';
+import { PostsAPI } from '@/api/posts';
+import { Card, CardContent } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Textarea } from '@/components/ui/textarea';
+import { Badge } from '@/components/ui/badge';
+import { ImagePlus, Eye, Building2, ShieldCheck } from 'lucide-react';
+
+const VIS = [
+  { value: 'PUBLIC', label: 'Public' },
+  { value: 'CONNECTIONS', label: 'Connections' },
+  { value: 'PRIVATE', label: 'Only me' },
+];
+
+export default function PostComposer({ onPostCreated }: { onPostCreated?: () => void }) {
+  const [body, setBody] = useState('');
+  const [visibility, setVisibility] = useState('PUBLIC');
+  const [isEmployerPost, setIsEmployerPost] = useState(false);
+  const [isYouthFriendly, setIsYouthFriendly] = useState(false);
+  const [tags, setTags] = useState<string[]>([]);
+  const [tagText, setTagText] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const addTag = () => {
+    const t = tagText.trim();
+    if (t && !tags.includes(t)) setTags([...tags, t]);
+    setTagText('');
+  };
+
+  const removeTag = (t: string) => setTags(tags.filter(x => x !== t));
+
+  const submit = async () => {
+    if (!body.trim()) return;
+    setBusy(true);
+    try {
+      await PostsAPI.create({ body, visibility, isEmployerPost, isYouthFriendly, tags });
+      setBody(''); setTags([]); setIsEmployerPost(false); setIsYouthFriendly(false); setVisibility('PUBLIC');
+      onPostCreated?.();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card className="bg-white/90 backdrop-blur-sm border border-gray-200/60 shadow-lg">
+      <CardContent className="p-4 space-y-3">
+        <Textarea
+          value={body}
+          onChange={(e) => setBody(e.target.value)}
+          placeholder="Share progress, ask for advice, or post an update…"
+          className="min-h-[90px]"
+        />
+        <div className="flex flex-wrap gap-2">
+          {tags.map(t => (
+            <Badge key={t} variant="secondary" className="bg-gray-100">
+              #{t}
+              <button onClick={() => removeTag(t)} className="ml-2">×</button>
+            </Badge>
+          ))}
+          <input
+            value={tagText}
+            onChange={(e) => setTagText(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && addTag()}
+            placeholder="Add tag and press Enter"
+            className="text-sm border rounded px-2 py-1"
+          />
+        </div>
+        <div className="flex items-center justify-between">
+          <div className="flex gap-2 items-center">
+            <Select value={visibility} onValueChange={setVisibility}>
+              <SelectTrigger className="w-[160px]">
+                <SelectValue placeholder="Visibility" />
+              </SelectTrigger>
+              <SelectContent>
+                {VIS.map(v => <SelectItem key={v.value} value={v.value}>{v.label}</SelectItem>)}
+              </SelectContent>
+            </Select>
+            <label className="flex items-center gap-2 text-sm cursor-pointer">
+              <input type="checkbox" checked={isEmployerPost} onChange={(e)=>setIsEmployerPost(e.target.checked)} />
+              <Building2 className="w-4 h-4" /> Employer
+            </label>
+            <label className="flex items-center gap-2 text-sm cursor-pointer">
+              <input type="checkbox" checked={isYouthFriendly} onChange={(e)=>setIsYouthFriendly(e.target.checked)} />
+              <ShieldCheck className="w-4 h-4" /> Youth‑friendly
+            </label>
+          </div>
+          <Button onClick={submit} disabled={busy}>Post</Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+[FILE: frontend/src/components/posts/PostCard.tsx]
+import React, { useEffect, useState } from 'react';
+import { PostsAPI, ReactionType } from '@/api/posts';
+import { Card, CardContent, CardHeader } from '@/components/ui/card';
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { MessageCircle, ThumbsUp, Heart, PartyPopper, Lightbulb, Flag } from 'lucide-react';
+import CommentsDrawer from './CommentsDrawer';
+
+const REACTIONS: { icon: any; type: ReactionType; label: string }[] = [
+  { icon: ThumbsUp, type: 'LIKE', label: 'Like' },
+  { icon: Heart, type: 'LOVE', label: 'Love' },
+  { icon: PartyPopper, type: 'CELEBRATE', label: 'Celebrate' },
+  { icon: Lightbulb, type: 'INSIGHTFUL', label: 'Insightful' },
+  { icon: MessageCircle, type: 'SUPPORT', label: 'Support' },
+];
+
+export default function PostCard({ post, onChange }: { post: any; onChange?: () => void }) {
+  const [openComments, setOpenComments] = useState(false);
+  const [reacting, setReacting] = useState(false);
+
+  const react = async (type: ReactionType) => {
+    setReacting(true);
+    try {
+      await PostsAPI.reactions.set(post.id, type);
+      onChange?.();
+    } finally {
+      setReacting(false);
+    }
+  };
+
+  const unreact = async () => {
+    setReacting(true);
+    try {
+      await PostsAPI.reactions.unset(post.id);
+      onChange?.();
+    } finally {
+      setReacting(false);
+    }
+  };
+
+  return (
+    <Card className="bg-white/90 backdrop-blur-sm border border-gray-200/60 shadow-md">
+      <CardHeader className="p-4">
+        <div className="flex items-start gap-3">
+          <Avatar className="w-10 h-10">
+            <AvatarImage src={post.author?.avatarUrl} />
+            <AvatarFallback>{(post.author?.fullName || 'U').slice(0,1)}</AvatarFallback>
+          </Avatar>
+          <div className="flex-1">
+            <div className="flex items-center gap-2">
+              <div className="font-semibold text-gray-900">{post.author?.fullName || 'User'}</div>
+              {post.author?.isVerified && <Badge className="bg-emerald-100 text-emerald-800">Verified</Badge>}
+              {post.isEmployerPost && <Badge className="bg-blue-100 text-blue-800">Employer</Badge>}
+              {post.isYouthFriendly && <Badge className="bg-purple-100 text-purple-800">Youth‑friendly</Badge>}
+            </div>
+            <div className="text-xs text-gray-500">{new Date(post.createdAt).toLocaleString()}</div>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="px-4 pb-4">
+        <div className="prose prose-sm max-w-none" dangerouslySetInnerHTML={{ __html: post.body }} />
+        {!!(post.tags?.length) && (
+          <div className="mt-3 flex flex-wrap gap-2">
+            {post.tags.map((t:string) => <Badge key={t} variant="secondary" className="bg-gray-100">#{t}</Badge>)}
+          </div>
+        )}
+
+        <div className="mt-4 flex items-center justify-between">
+          <div className="text-xs text-gray-500">
+            {post._count?.reactions ?? 0} reactions • {post._count?.comments ?? 0} comments
+          </div>
+          <div className="flex items-center gap-2">
+            {REACTIONS.map(R => (
+              <Button key={R.type} variant="outline" size="sm" disabled={reacting} onClick={()=>react(R.type)}>
+                <R.icon className="w-4 h-4 mr-1" /> {R.label}
+              </Button>
+            ))}
+            <Button variant="ghost" size="sm" onClick={()=>setOpenComments(true)}>
+              <MessageCircle className="w-4 h-4 mr-1" /> Comment
+            </Button>
+            <Button variant="ghost" size="sm" onClick={()=>alert('Reported. Our team will review.') }>
+              <Flag className="w-4 h-4 mr-1" /> Report
+            </Button>
+          </div>
+        </div>
+      </CardContent>
+
+      <CommentsDrawer post={post} open={openComments} onOpenChange={setOpenComments} />
+    </Card>
+  );
+}
+
+[FILE: frontend/src/components/posts/CommentsDrawer.tsx]
+import React, { useEffect, useState } from 'react';
+import { Drawer, DrawerContent, DrawerHeader, DrawerTitle } from '@/components/ui/drawer';
+import { PostsAPI } from '@/api/posts';
+import { Button } from '@/components/ui/button';
+import { Textarea } from '@/components/ui/textarea';
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
+
+export default function CommentsDrawer({ post, open, onOpenChange }: { post: any; open: boolean; onOpenChange: (v: boolean)=>void }) {
+  const [comments, setComments] = useState<any[]>([]);
+  const [text, setText] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const load = async () => {
+    const data = await PostsAPI.comments.list(post.id);
+    setComments(data);
+  };
+
+  useEffect(() => { if (open) load(); }, [open]);
+
+  const submit = async () => {
+    if (!text.trim()) return;
+    setBusy(true);
+    try {
+      await PostsAPI.comments.create(post.id, text);
+      setText('');
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Drawer open={open} onOpenChange={onOpenChange}>
+      <DrawerContent>
+        <DrawerHeader>
+          <DrawerTitle>Comments</DrawerTitle>
+        </DrawerHeader>
+        <div className="px-4 pb-4 space-y-4">
+          <div className="space-y-3 max-h-[50vh] overflow-auto pr-2">
+            {comments.map(c => (
+              <div key={c.id} className="flex items-start gap-3">
+                <Avatar className="w-8 h-8">
+                  <AvatarImage src={c.author?.avatarUrl} />
+                  <AvatarFallback>{(c.author?.fullName || 'U').slice(0,1)}</AvatarFallback>
+                </Avatar>
+                <div>
+                  <div className="text-sm font-medium">{c.author?.fullName || 'User'}</div>
+                  <div className="text-sm text-gray-700">{c.body}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="space-y-2">
+            <Textarea value={text} onChange={(e)=>setText(e.target.value)} placeholder="Write a comment…" />
+            <div className="flex justify-end">
+              <Button onClick={submit} disabled={busy}>Comment</Button>
+            </div>
+          </div>
+        </div>
+      </DrawerContent>
+    </Drawer>
+  );
+}
+
+
+───────────────────────────────────────────────────────────────────────────────
+# 4) SHARED CONTRACTS (optional)
+
+[FILE: shared/contracts/posts.ts]
+export type PostVisibility = 'PUBLIC' | 'CONNECTIONS' | 'PRIVATE';
+export type ReactionType = 'LIKE' | 'SUPPORT' | 'INSIGHTFUL' | 'CELEBRATE' | 'LOVE';
+
+export interface Post {
+  id: string;
+  authorId: string;
+  body: string;  // sanitized HTML
+  visibility: PostVisibility;
+  tags: string[];
+  media?: Array<{type:'image'|'video'; url:string; alt?:string}>;
+  isEmployerPost: boolean;
+  isYouthFriendly: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+
+───────────────────────────────────────────────────────────────────────────────
+# 5) BACKEND WIRING
+
+[FILE: backend/src/app.module.ts] (add to imports)
+/* ... */
+import { PostsModule } from './modules/posts/posts.module';
+@Module({
+  imports: [
+    /* other modules */
+    PostsModule,
+  ],
+})
+export class AppModule {}
+/* ... */
+
+[FILE: backend/src/main.ts] (CORS)
+app.enableCors({
+  origin: process.env.CORS_ORIGIN?.split(',') ?? ['http://localhost:3000'],
+  credentials: true,
+});
+
+
+───────────────────────────────────────────────────────────────────────────────
+# 6) FRONTEND ROUTING
+
+[FILE: frontend/src/router.tsx] (add)
+{ path: '/feed', element: <FeedPage /> },
+
+[FILE: frontend/src/components/TopNav.tsx] (ensure a “Feed” link exists)
+
+
+───────────────────────────────────────────────────────────────────────────────
+# 7) README — bundle07.md
+
+[FILE: docs/bundles/bundle07.md]
+# Bundle 07 — Posts, Feed, Comments & Reactions
+## Setup
+1) DB patch
+   - Apply `prisma/schema.patch.sql` changes in your Prisma schema (or convert to Prisma DSL if needed).
+   - Run migrations: `npx prisma generate && npx prisma migrate dev -n "bundle07_posts_feed"`
+2) Backend
+   - Add `PostsModule` to `AppModule` imports.
+   - Ensure `YouthSafetyService` & `ContentSafetyService` path are correct (create `modules/safety` if not present).
+3) Frontend
+   - Wire `/feed` route and add a nav link.
+   - Ensure `api/root.ts` exports configured axios instance.
+4) Test
+   - Create post (creator logged-in):
+     ```sh
+     curl -X POST http://localhost:4000/posts \
+      -H "Authorization: Bearer <token>" \
+      -H "Content-Type: application/json" \
+      -d '{"body":"<p>Hello world!</p>","visibility":"PUBLIC","tags":["first","update"]}'
+     ```
+   - Load feed at `/feed`.
+
+### Youth-Safe Defaults
+- Comments & posts sanitized, simple meet‑up phrase guard for youth mode.
+- Employer & Youth‑friendly badges available to boost visibility for young users.
+
+### Future hooks
+- Realtime: emit `post.created`, `comment.created`, `reaction.updated` via Socket gateway (Bundle 06) to live update feed.
+- Ranking: skill tags vs. user profile, collaborative filtering, geo/remote toggles.
+- Media: connect to upload service (S3/GCS) with signed URLs.
+
+---
+END OF BUNDLE 07

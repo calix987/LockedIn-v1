@@ -1,0 +1,827 @@
+
+LOCKEDIN — BUNDLE 05
+AI Coach, Interview Prep, and Draft Generators
+=================================================
+
+This bundle wires up:
+- Backend (NestJS): AI Coach module with chat sessions, interview practice, and resume/cover letter draft endpoints. 
+- Provider-agnostic LLM interface (no API keys committed; reads from env at runtime).
+- Safety guardrails for youth mode and policy constraints (no IRL meetups, no personal contact exchange).
+- Frontend (React/Next/SPA compatible): Coach UI with chat, interview practice, and draft generators.
+- Prisma schema add-ons for CoachSession and CoachMessage.
+- Light e2e contract tests (mocked provider).
+
+IMPORTANT
+---------
+- **No secrets included**. Configure providers via environment variables at deploy time:
+  - `AI_PROVIDER` = one of: `mock` | `openai` | `anthropic`
+  - `AI_MODEL`    = model id, e.g., `gpt-4o-mini` or `claude-3-5-sonnet`
+  - `AI_API_KEY`  = provider API key
+- Streaming is optional and mocked; HTTP JSON responses are enabled by default.
+- Under-18 (YOUTH) users: guardrails reduce capabilities (e.g., no unverified contact sharing, no meetups), coach gives safety reminders.
+
+-------------------------------------------------------------------------------
+FOLDER LAYOUT (drop-in)
+-------------------------------------------------------------------------------
+backend/
+  src/
+    ai-coach/
+      ai-coach.module.ts
+      ai-coach.controller.ts
+      ai-coach.service.ts
+      llm/
+        llm.provider.ts
+        providers/
+          mock.provider.ts
+          openai.provider.ts      // uses env, not bundled secrets
+          anthropic.provider.ts   // uses env, not bundled secrets
+      prompts/
+        base.prompts.ts
+        interview.prompts.ts
+        drafts.prompts.ts
+      safety/
+        safety.guard.ts
+        youth.policy.ts
+        rate-limit.guard.ts
+    common/
+      dto/pagination.dto.ts
+      utils/env.ts
+  prisma/
+    schema.coach.prisma.patch
+frontend/
+  src/
+    pages/Coach/index.tsx
+    components/coach/Chat.tsx
+    components/coach/Message.tsx
+    components/coach/InterviewPrep.tsx
+    components/coach/DraftGenerators.tsx
+    lib/coachClient.ts
+tests/
+  ai-coach.contract.test.ts
+README-BUNDLE-05.md
+
+-------------------------------------------------------------------------------
+PRISMA SCHEMA PATCH (append to prisma/schema.prisma)
+-------------------------------------------------------------------------------
+/* schema.coach.prisma.patch */
+model CoachSession {
+  id            String        @id @default(cuid())
+  userId        String
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  mode          CoachMode     @default(CHAT)
+  messages      CoachMessage[]
+}
+
+model CoachMessage {
+  id            String      @id @default(cuid())
+  sessionId     String
+  role          CoachRole
+  content       String
+  createdAt     DateTime    @default(now())
+  CoachSession  CoachSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+}
+
+enum CoachMode {
+  CHAT
+  INTERVIEW
+  DRAFTS
+}
+
+enum CoachRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+-------------------------------------------------------------------------------
+BACKEND (NestJS)
+-------------------------------------------------------------------------------
+
+// backend/src/ai-coach/ai-coach.module.ts
+import { Module } from '@nestjs/common';
+import { AiCoachController } from './ai-coach.controller';
+import { AiCoachService } from './ai-coach.service';
+import { LlmProvider } from './llm/llm.provider';
+import { MockProvider } from './llm/providers/mock.provider';
+import { OpenAIProvider } from './llm/providers/openai.provider';
+import { AnthropicProvider } from './llm/providers/anthropic.provider';
+import { SafetyGuard } from './safety/safety.guard';
+import { YouthPolicy } from './safety/youth.policy';
+import { RateLimitGuard } from './safety/rate-limit.guard';
+
+@Module({
+  controllers: [AiCoachController],
+  providers: [
+    AiCoachService,
+    LlmProvider,
+    MockProvider,
+    OpenAIProvider,
+    AnthropicProvider,
+    SafetyGuard,
+    YouthPolicy,
+    RateLimitGuard,
+  ],
+  exports: [AiCoachService],
+})
+export class AiCoachModule {}
+
+
+// backend/src/ai-coach/ai-coach.controller.ts
+import { Body, Controller, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { AiCoachService } from './ai-coach.service';
+import { SafetyGuard } from './safety/safety.guard';
+import { RateLimitGuard } from './safety/rate-limit.guard';
+
+@Controller('api/ai/coach')
+@UseGuards(SafetyGuard, RateLimitGuard)
+export class AiCoachController {
+  constructor(private readonly service: AiCoachService) {}
+
+  @Post('session')
+  async createSession(@Body() body: { userId: string; mode?: 'CHAT'|'INTERVIEW'|'DRAFTS' }) {
+    return this.service.createSession(body.userId, body.mode || 'CHAT');
+  }
+
+  @Get('session/:id')
+  async getSession(@Param('id') id: string) {
+    return this.service.getSession(id);
+  }
+
+  @Post('message')
+  async sendMessage(@Body() body: { sessionId: string; userId: string; message: string; ageMode?: 'YOUTH'|'ADULT' }) {
+    return this.service.chat(body.sessionId, body.userId, body.message, body.ageMode || 'ADULT');
+  }
+
+  @Post('interview/questions')
+  async genInterview(@Body() body: { userId: string; role: string; seniority?: string; company?: string }) {
+    return this.service.generateInterviewQuestions(body);
+  }
+
+  @Post('interview/answer')
+  async scoreAnswer(@Body() body: { question: string; answer: string; role: string }) {
+    return this.service.scoreInterviewAnswer(body);
+  }
+
+  @Post('draft/resume')
+  async draftResume(@Body() body: { userId: string; targetRole?: string; jobDescription?: string }) {
+    return this.service.generateResume(body);
+  }
+
+  @Post('draft/cover-letter')
+  async draftCover(@Body() body: { userId: string; targetRole?: string; jobDescription?: string; company?: string }) {
+    return this.service.generateCoverLetter(body);
+  }
+}
+
+
+// backend/src/ai-coach/ai-coach.service.ts
+import { Injectable } from '@nestjs/common';
+import { LlmProvider } from './llm/llm.provider';
+import * as Prompts from './prompts/base.prompts';
+import * as Drafts from './prompts/drafts.prompts';
+import * as Interview from './prompts/interview.prompts';
+
+type AgeMode = 'YOUTH'|'ADULT';
+
+@Injectable()
+export class AiCoachService {
+  constructor(private readonly llm: LlmProvider) {}
+
+  // Swap to Prisma repos in your app; here minimal in-memory for portability
+  private sessions = new Map<string, { id: string; userId: string; mode: string; messages: any[] }>();
+
+  private cuid() {
+    return 'c' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+
+  async createSession(userId: string, mode: string) {
+    const id = this.cuid();
+    const session = { id, userId, mode, messages: [] as any[] };
+    this.sessions.set(id, session);
+    return session;
+  }
+
+  async getSession(id: string) {
+    const s = this.sessions.get(id);
+    if (!s) throw new Error('Session not found');
+    return s;
+  }
+
+  async chat(sessionId: string, userId: string, message: string, ageMode: AgeMode) {
+    const s = await this.getSession(sessionId);
+    const system = Prompts.systemPrompt(ageMode);
+    const history = s.messages.map(m => ({ role: m.role, content: m.content }));
+    const input = [...system, ...history, { role: 'user', content: message }];
+    const reply = await this.llm.complete({ messages: input, maxTokens: 600 });
+    s.messages.push({ id: this.cuid(), role: 'user', content: message });
+    s.messages.push({ id: this.cuid(), role: 'assistant', content: reply });
+    return { sessionId, message: reply };
+  }
+
+  async generateInterviewQuestions(body: { userId: string; role: string; seniority?: string; company?: string }) {
+    const prompt = Interview.questionsPrompt(body.role, body.seniority, body.company);
+    const text = await this.llm.complete({ messages: [{ role: 'system', content: Interview.system }, { role: 'user', content: prompt }], maxTokens: 900 });
+    return { questions: Interview.parseQuestions(text) };
+  }
+
+  async scoreInterviewAnswer(body: { question: string; answer: string; role: string }) {
+    const prompt = Interview.scorePrompt(body.question, body.answer, body.role);
+    const text = await this.llm.complete({ messages: [{ role: 'system', content: Interview.system }, { role: 'user', content: prompt }], maxTokens: 600 });
+    return Interview.parseScore(text);
+  }
+
+  async generateResume(body: { userId: string; targetRole?: string; jobDescription?: string }) {
+    const text = await this.llm.complete({ messages: [{ role: 'system', content: Drafts.system }, { role: 'user', content: Drafts.resumePrompt(body) }], maxTokens: 1600 });
+    return Drafts.parseResume(text);
+  }
+
+  async generateCoverLetter(body: { userId: string; targetRole?: string; jobDescription?: string; company?: string }) {
+    const text = await this.llm.complete({ messages: [{ role: 'system', content: Drafts.system }, { role: 'user', content: Drafts.coverPrompt(body) }], maxTokens: 1200 });
+    return Drafts.parseCover(text);
+  }
+}
+
+
+// backend/src/ai-coach/llm/llm.provider.ts
+import { Injectable, Inject } from '@nestjs/common';
+import { MockProvider } from './providers/mock.provider';
+import { OpenAIProvider } from './providers/openai.provider';
+import { AnthropicProvider } from './providers/anthropic.provider';
+
+type Message = { role: 'system'|'user'|'assistant'; content: string };
+
+@Injectable()
+export class LlmProvider {
+  private impl: { complete(args: { messages: Message[]; maxTokens?: number }): Promise<string> };
+
+  constructor(
+    private readonly mock: MockProvider,
+    private readonly openai: OpenAIProvider,
+    private readonly anthropic: AnthropicProvider,
+  ) {
+    const provider = process.env.AI_PROVIDER || 'mock';
+    if (provider === 'openai') this.impl = this.openai;
+    else if (provider === 'anthropic') this.impl = this.anthropic;
+    else this.impl = this.mock;
+  }
+
+  async complete(args: { messages: Message[]; maxTokens?: number }) {
+    return this.impl.complete(args);
+  }
+}
+
+
+// backend/src/ai-coach/llm/providers/mock.provider.ts
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class MockProvider {
+  async complete({ messages }: { messages: { role: string; content: string }[] }) {
+    const last = messages[messages.length - 1]?.content || '';
+    return `Mock reply to: ${last.slice(0, 140)} ...`;
+  }
+}
+
+
+// backend/src/ai-coach/llm/providers/openai.provider.ts
+import { Injectable } from '@nestjs/common';
+// NOTE: Do not ship provider SDKs if you prefer pure fetch; keeping pseudo for portability.
+@Injectable()
+export class OpenAIProvider {
+  async complete({ messages, maxTokens = 800 }: { messages: any[]; maxTokens?: number }) {
+    const apiKey = process.env.AI_API_KEY;
+    const model = process.env.AI_MODEL || 'gpt-4o-mini';
+    if (!apiKey) throw new Error('AI_API_KEY missing');
+    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature: 0.3 }),
+    });
+    const json = await resp.json();
+    return json?.choices?.[0]?.message?.content ?? 'Sorry, I could not generate a response.';
+  }
+}
+
+
+// backend/src/ai-coach/llm/providers/anthropic.provider.ts
+import { Injectable } from '@nestjs/common';
+@Injectable()
+export class AnthropicProvider {
+  async complete({ messages, maxTokens = 800 }: { messages: any[]; maxTokens?: number }) {
+    const apiKey = process.env.AI_API_KEY;
+    const model = process.env.AI_MODEL || 'claude-3-5-sonnet-20240620';
+    if (!apiKey) throw new Error('AI_API_KEY missing');
+    // Convert OpenAI style messages to Claude format
+    const sys = messages.find(m => m.role === 'system')?.content || 'You are a helpful assistant.';
+    const userTurn = messages.filter(m => m.role !== 'system').map(m => ({ role: m.role, content: m.content }));
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model, system: sys, max_tokens: maxTokens, messages: userTurn }),
+    });
+    const json = await resp.json();
+    const content = json?.content?.[0]?.text || json?.content || '';
+    return content || 'Sorry, I could not generate a response.';
+  }
+}
+
+
+// backend/src/ai-coach/prompts/base.prompts.ts
+export const systemPrompt = (ageMode: 'YOUTH'|'ADULT') => {
+  const base = `You are LockedIn Career Coach. Be practical, concise, and specific.
+Never suggest in-person meetups or personal contact exchange.
+Focus on job search, applications, interview skills, resume/cover letters, and professional etiquette.
+When giving steps, use short numbered lists and examples.`;
+
+  const youth = `User is a minor. Enforce youth-safety:
+- No IRL meetings; only platform-native messaging with verified employers.
+- Avoid collecting personal contact details.
+- Encourage involving a trusted adult for offers.
+- Use supportive tone.`;
+
+  return [
+    { role: 'system', content: base + (ageMode === 'YOUTH' ? '\n' + youth : '') },
+  ] as const;
+};
+
+
+// backend/src/ai-coach/prompts/interview.prompts.ts
+export const system = `You are an expert interviewer. Create role-appropriate behavioral and technical questions.
+Return answers in clean JSON when asked to score.`;
+
+export const questionsPrompt = (role: string, seniority?: string, company?: string) =>
+  `Generate 8 interview questions for a ${seniority || 'entry-level'} ${role}${
+    company ? ' at ' + company : ''
+  }. Mix behavioral and role-specific. Keep them concise.`;
+
+export const scorePrompt = (question: string, answer: string, role: string) =>
+  `Given the question: "${question}" and the candidate's answer below, score from 1-10, list 3 strengths and 3 improvements, and give a model answer for ${role}.
+Return strict JSON with fields: { "score": number, "strengths": string[], "improvements": string[], "model_answer": string }.
+Answer: """${answer}"""`;
+
+export const parseQuestions = (raw: string) => {
+  // naive split; providers may already format as bullets
+  return raw.split(/\n+/).filter(Boolean).slice(0, 12).map((q, i) => q.replace(/^\d+[.)]\s*/, '')).slice(0,8);
+};
+
+export const parseScore = (raw: string) => {
+  try {
+    const jsonMatch = raw.match(/\{[\s\S]*\}$/);
+    if (jsonMatch) return JSON.parse(jsonMatch[0]);
+  } catch {}
+  return { score: 6, strengths: ['communicated effort'], improvements: ['add concrete metrics'], model_answer: 'Provide a STAR response with metrics.' };
+};
+
+
+// backend/src/ai-coach/prompts/drafts.prompts.ts
+export const system = `You are a resume and cover-letter writer. You write concise, ATS-friendly content with metrics.`;
+
+export const resumePrompt = (body: { targetRole?: string; jobDescription?: string }) => `Create a JSON resume for target role "${body.targetRole || 'General'}". 
+Keep it 1 page and ATS-friendly. Use bullet points with metrics.
+Optional job description context:
+"""${body.jobDescription || ''}"""
+Return JSON with fields:
+{
+  "headline": string,
+  "summary": string,
+  "skills": string[],
+  "experience": [{"title": string, "company": string, "dates": string, "bullets": string[]}],
+  "projects": [{"name": string, "bullets": string[]}],
+  "education": [{"school": string, "degree": string, "dates": string}]
+}`;
+
+export const coverPrompt = (body: { targetRole?: string; jobDescription?: string; company?: string }) => `Write a brief cover letter (200-300 words) for role "${body.targetRole || 'General'}"${ body.company ? ' at ' + body.company : '' }.
+Use 3 short paragraphs (why me, proof with metrics, why this company). Mirror key phrases from the job description:
+"""${body.jobDescription || ''}"""`;
+
+export const parseResume = (raw: string) => {
+  try { return JSON.parse(raw); } catch { return { headline: '', summary: raw.slice(0,500), skills: [], experience: [], projects: [], education: [] }; }
+};
+export const parseCover = (raw: string) => ({ coverLetter: raw.trim() });
+
+
+// backend/src/ai-coach/safety/youth.policy.ts
+import { Injectable } from '@nestjs/common';
+@Injectable()
+export class YouthPolicy {
+  sanitize(input: string) {
+    // strip contact & meetup invitations
+    return input
+      .replace(/(email|e-mail|phone|whatsapp|telegram|snap|ig|instagram|meet(?:\s?up)?)/gi, '[redacted]')
+      .replace(/\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b/g, '[redacted]');
+  }
+}
+
+
+// backend/src/ai-coach/safety/safety.guard.ts
+import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
+import { YouthPolicy } from './youth.policy';
+
+@Injectable()
+export class SafetyGuard implements CanActivate {
+  constructor(private readonly youth: YouthPolicy) {}
+  canActivate(ctx: ExecutionContext): boolean {
+    const req = ctx.switchToHttp().getRequest();
+    // best-effort sanitization; real check would inspect user record for age_mode
+    const isYouth = (req.body?.ageMode || '').toUpperCase() === 'YOUTH';
+    if (isYouth && typeof req.body?.message === 'string') {
+      req.body.message = this.youth.sanitize(req.body.message);
+    }
+    return true;
+  }
+}
+
+
+// backend/src/ai-coach/safety/rate-limit.guard.ts
+import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
+
+const BUCKET = new Map<string, { count: number; ts: number }>();
+
+@Injectable()
+export class RateLimitGuard implements CanActivate {
+  canActivate(ctx: ExecutionContext): boolean {
+    const req = ctx.switchToHttp().getRequest();
+    const ip = req.ip || 'unknown';
+    const now = Date.now();
+    const winMs = 15 * 1000;
+    const maxReq = 8;
+    const slot = BUCKET.get(ip) || { count: 0, ts: now };
+    if (now - slot.ts > winMs) {
+      BUCKET.set(ip, { count: 1, ts: now });
+      return true;
+    }
+    if (slot.count >= maxReq) throw new Error('Too many requests. Please slow down.');
+    slot.count += 1;
+    BUCKET.set(ip, slot);
+    return true;
+  }
+}
+
+
+// backend/src/common/utils/env.ts
+export const env = (key: string, fallback?: string) => {
+  const v = process.env[key];
+  if (v === undefined || v === null || v === '') return fallback;
+  return v;
+};
+
+-------------------------------------------------------------------------------
+FRONTEND (React)
+-------------------------------------------------------------------------------
+
+// frontend/src/lib/coachClient.ts
+export type CoachSession = { id: string; userId: string; mode: 'CHAT'|'INTERVIEW'|'DRAFTS'; messages?: any[] };
+export async function createSession(userId: string, mode: 'CHAT'|'INTERVIEW'|'DRAFTS'='CHAT') {
+  const r = await fetch('/api/ai/coach/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId, mode }) });
+  return r.json();
+}
+export async function getSession(id: string) {
+  const r = await fetch(`/api/ai/coach/session/${id}`);
+  return r.json();
+}
+export async function sendMessage(sessionId: string, userId: string, message: string, ageMode: 'YOUTH'|'ADULT') {
+  const r = await fetch('/api/ai/coach/message', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId, userId, message, ageMode }) });
+  return r.json();
+}
+export async function genInterview(role: string, seniority?: string, company?: string) {
+  const r = await fetch('/api/ai/coach/interview/questions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: 'me', role, seniority, company }) });
+  return r.json();
+}
+export async function scoreInterview(question: string, answer: string, role: string) {
+  const r = await fetch('/api/ai/coach/interview/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question, answer, role }) });
+  return r.json();
+}
+export async function draftResume(payload: { targetRole?: string; jobDescription?: string }) {
+  const r = await fetch('/api/ai/coach/draft/resume', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+  return r.json();
+}
+export async function draftCoverLetter(payload: { targetRole?: string; jobDescription?: string; company?: string }) {
+  const r = await fetch('/api/ai/coach/draft/cover-letter', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+  return r.json();
+}
+
+
+// frontend/src/components/coach/Message.tsx
+import React from 'react';
+export function Message({ role, content }: { role: 'user'|'assistant'; content: string }) {
+  return (
+    <div className={`w-full flex ${role==='user' ? 'justify-end' : 'justify-start'}`}>
+      <div className={`max-w-[75%] rounded-2xl px-4 py-3 shadow
+        ${role==='user' ? 'bg-indigo-600 text-white' : 'bg-white border border-gray-200/60'}`}>
+        <div className="whitespace-pre-wrap text-sm leading-relaxed">{content}</div>
+      </div>
+    </div>
+  );
+}
+
+
+// frontend/src/components/coach/Chat.tsx
+import React, { useEffect, useRef, useState } from 'react';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Message } from './Message';
+import * as Client from '@/lib/coachClient';
+
+export default function Chat({ user }: { user: any }) {
+  const [session, setSession] = useState<any>(null);
+  const [msgs, setMsgs] = useState<{ role: 'user'|'assistant'; content: string }[]>([]);
+  const [text, setText] = useState('');
+  const [sending, setSending] = useState(false);
+  const scroller = useRef<HTMLDivElement>(null);
+
+  useEffect(() => { (async () => {
+    const s = await Client.createSession(user.id, 'CHAT');
+    setSession(s);
+  })(); }, [user?.id]);
+
+  useEffect(() => { scroller.current?.scrollTo({ top: 999999, behavior: 'smooth' }); }, [msgs.length]);
+
+  const onSend = async () => {
+    if (!text.trim() || !session) return;
+    const content = text.trim();
+    setMsgs(m => [...m, { role:'user', content }]);
+    setText('');
+    setSending(true);
+    try {
+      const r = await Client.sendMessage(session.id, user.id, content, user?.age_mode || 'ADULT');
+      setMsgs(m => [...m, { role:'assistant', content: r.message }]);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-full">
+      <div ref={scroller} className="flex-1 overflow-auto space-y-3 p-4 bg-gradient-to-br from-gray-50 via-white to-blue-50 rounded-xl border">
+        {msgs.map((m, i) => <Message key={i} role={m.role} content={m.content} />)}
+        {sending && <div className="text-xs text-gray-500">Coach is typing…</div>}
+      </div>
+      <div className="mt-3 flex gap-2">
+        <Input placeholder="Ask for help with your search, resume, or interviews…" value={text} onChange={e => setText(e.target.value)} onKeyDown={(e)=> e.key==='Enter'&&onSend()} />
+        <Button onClick={onSend} disabled={sending}>Send</Button>
+      </div>
+      {user?.age_mode === 'YOUTH' && (
+        <p className="text-[11px] text-emerald-700 mt-2">
+          Youth-Safe: never share personal contact; keep chats on-platform with verified employers.
+        </p>
+      )}
+    </div>
+  );
+}
+
+
+// frontend/src/components/coach/InterviewPrep.tsx
+import React, { useState } from 'react';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
+import * as Client from '@/lib/coachClient';
+
+export default function InterviewPrep({ user }: { user: any }) {
+  const [role, setRole] = useState('Software Engineer Intern');
+  const [qs, setQs] = useState<string[]>([]);
+  const [selected, setSelected] = useState<string>('');
+  const [answer, setAnswer] = useState('');
+  const [score, setScore] = useState<any>(null);
+
+  const load = async () => {
+    const r = await Client.genInterview(role);
+    setQs(r.questions || []);
+  };
+  const evaluate = async () => {
+    const r = await Client.scoreInterview(selected, answer, role);
+    setScore(r);
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex gap-2">
+        <Input value={role} onChange={e=>setRole(e.target.value)} />
+        <Button onClick={load}>Generate Questions</Button>
+      </div>
+      <div className="grid md:grid-cols-2 gap-4">
+        <div className="space-y-2">
+          {qs.map((q,i)=>(
+            <button key={i} onClick={()=>setSelected(q)} className={`w-full text-left p-3 rounded-lg border ${selected===q?'border-indigo-400 bg-indigo-50':'border-gray-200 bg-white'}`}>
+              {q}
+            </button>
+          ))}
+        </div>
+        <div className="space-y-2">
+          <Textarea rows={8} placeholder="Record or paste your answer here..." value={answer} onChange={e=>setAnswer(e.target.value)} />
+          <Button onClick={evaluate} disabled={!selected || !answer.trim()}>Score Answer</Button>
+          {score && (
+            <div className="p-3 border rounded-lg bg-white">
+              <div className="font-semibold">Score: {score.score ?? '—'}/10</div>
+              <div className="mt-2">
+                <div className="text-sm font-semibold">Strengths</div>
+                <ul className="list-disc ml-5 text-sm">{(score.strengths||[]).map((s:string,i:number)=><li key={i}>{s}</li>)}</ul>
+                <div className="text-sm font-semibold mt-2">Improvements</div>
+                <ul className="list-disc ml-5 text-sm">{(score.improvements||[]).map((s:string,i:number)=><li key={i}>{s}</li>)}</ul>
+                <div className="text-sm font-semibold mt-2">Model Answer</div>
+                <pre className="text-xs whitespace-pre-wrap">{score.model_answer}</pre>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// frontend/src/components/coach/DraftGenerators.tsx
+import React, { useState } from 'react';
+import { Button } from '@/components/ui/button';
+import { Textarea } from '@/components/ui/textarea';
+import { Input } from '@/components/ui/input';
+import * as Client from '@/lib/coachClient';
+
+export default function DraftGenerators({ user }: { user: any }) {
+  const [targetRole, setTargetRole] = useState('Software Engineer Intern');
+  const [jd, setJd] = useState('');
+  const [resume, setResume] = useState<any>(null);
+  const [cover, setCover] = useState('');
+
+  const runResume = async () => {
+    const r = await Client.draftResume({ targetRole, jobDescription: jd });
+    setResume(r);
+  };
+  const runCover = async () => {
+    const r = await Client.draftCoverLetter({ targetRole, jobDescription: jd, company: '' });
+    setCover(r.coverLetter || '');
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="grid md:grid-cols-2 gap-4">
+        <div>
+          <label className="text-sm font-medium">Target Role</label>
+          <Input value={targetRole} onChange={e=>setTargetRole(e.target.value)} />
+        </div>
+        <div className="md:col-span-2">
+          <label className="text-sm font-medium">Job Description (paste)</label>
+          <Textarea rows={6} value={jd} onChange={e=>setJd(e.target.value)} />
+        </div>
+      </div>
+      <div className="flex gap-2">
+        <Button onClick={runResume}>Generate Resume JSON</Button>
+        <Button onClick={runCover} variant="outline">Generate Cover Letter</Button>
+      </div>
+      {resume && (
+        <div className="p-3 border rounded-lg bg-white">
+          <div className="font-semibold">Resume (JSON)</div>
+          <pre className="text-xs whitespace-pre-wrap">{JSON.stringify(resume, null, 2)}</pre>
+        </div>
+      )}
+      {cover && (
+        <div className="p-3 border rounded-lg bg-white">
+          <div className="font-semibold mb-1">Cover Letter</div>
+          <pre className="text-sm whitespace-pre-wrap">{cover}</pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// frontend/src/pages/Coach/index.tsx
+import React, { useEffect, useState } from 'react';
+import Chat from '@/components/coach/Chat';
+import InterviewPrep from '@/components/coach/InterviewPrep';
+import DraftGenerators from '@/components/coach/DraftGenerators';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { SparklesIcon, MessageSquareIcon, MicIcon, FileTextIcon } from 'lucide-react';
+import { User } from '@/entities/all';
+
+export default function CoachPage() {
+  const [user, setUser] = useState<any>(null);
+  useEffect(()=>{ (async()=>{ const u = await User.me(); setUser(u); })(); }, []);
+  if (!user) return <div className="p-6">Loading…</div>;
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 via-white to-blue-50 p-6 md:p-8">
+      <div className="max-w-6xl mx-auto space-y-6">
+        <Card className="bg-gradient-to-r from-indigo-50 to-purple-50 border border-indigo-200/60 shadow-lg">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-indigo-900">
+              <SparklesIcon className="w-5 h-5 text-indigo-600" />
+              AI Career Coach
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="text-indigo-800">
+            Get tailored guidance on your job search, practice interviews, and generate resume or cover-letter drafts.
+          </CardContent>
+        </Card>
+
+        <Tabs defaultValue="chat">
+          <TabsList className="bg-white/90 backdrop-blur-sm border border-gray-200/60 shadow-md">
+            <TabsTrigger value="chat" className="flex items-center gap-2"><MessageSquareIcon className="w-4 h-4" /> Chat</TabsTrigger>
+            <TabsTrigger value="interview" className="flex items-center gap-2"><MicIcon className="w-4 h-4" /> Interview Prep</TabsTrigger>
+            <TabsTrigger value="drafts" className="flex items-center gap-2"><FileTextIcon className="w-4 h-4" /> Drafts</TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="chat" className="mt-4">
+            <Card className="bg-white/90 backdrop-blur-sm border border-gray-200/60 shadow-lg">
+              <CardContent className="p-4">
+                <Chat user={user} />
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="interview" className="mt-4">
+            <Card className="bg-white/90 backdrop-blur-sm border border-gray-200/60 shadow-lg">
+              <CardContent className="p-4">
+                <InterviewPrep user={user} />
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="drafts" className="mt-4">
+            <Card className="bg-white/90 backdrop-blur-sm border border-gray-200/60 shadow-lg">
+              <CardContent className="p-4">
+                <DraftGenerators user={user} />
+              </CardContent>
+            </Card>
+          </TabsContent>
+        </Tabs>
+      </div>
+    </div>
+  );
+}
+
+-------------------------------------------------------------------------------
+TEST (Mocked Contract)
+-------------------------------------------------------------------------------
+
+// tests/ai-coach.contract.test.ts
+/**
+ * Pseudo test, provider mocked.
+ * Run in your monorepo runner after mounting routes.
+ */
+import assert from 'assert';
+
+async function post(path: string, body: any) {
+  const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  return r.json();
+}
+
+(async () => {
+  const s = await post('/api/ai/coach/session', { userId: 'u1' });
+  assert(s.id);
+  const chat = await post('/api/ai/coach/message', { sessionId: s.id, userId: 'u1', message: 'How do I tailor my resume?', ageMode: 'YOUTH' });
+  assert(chat.message);
+  const qs = await post('/api/ai/coach/interview/questions', { userId: 'u1', role: 'Data Analyst' });
+  assert(Array.isArray(qs.questions) && qs.questions.length > 0);
+  const score = await post('/api/ai/coach/interview/answer', { question: qs.questions[0], answer: 'I used SQL and dashboards', role: 'Data Analyst' });
+  assert(score.score !== undefined);
+  const resume = await post('/api/ai/coach/draft/resume', { userId: 'u1', targetRole: 'Data Analyst' });
+  assert(resume);
+  console.log('AI Coach contract OK');
+})().catch(e => { console.error(e); process.exit(1); });
+
+-------------------------------------------------------------------------------
+README
+-------------------------------------------------------------------------------
+
+# Bundle 05 — AI Coach & Drafts
+
+## What’s inside
+- NestJS AI Coach module with chat, interview prep, and draft generation endpoints.
+- LLM provider abstraction with `mock`, `openai`, and `anthropic` implementations.
+- Youth safety guardrails and simple IP-based rate limit guard.
+- React coach UI with Chat, Interview Prep, and Draft Generators.
+
+## Setup
+1) Append `prisma/schema.prisma` with the **schema.coach.prisma.patch** content, then:
+   ```sh
+   npx prisma migrate dev -n "add_ai_coach"
+   ```
+   (Adjust if you manage sessions/messages differently.)
+
+2) Backend env:
+   ```env
+   AI_PROVIDER=mock   # or openai | anthropic
+   AI_MODEL=gpt-4o-mini  # or a Claude model
+   AI_API_KEY=          # set only in your secret manager
+   ```
+
+3) Mount the module in your Nest root module:
+   ```ts
+   import { AiCoachModule } from './ai-coach/ai-coach.module';
+   @Module({ imports: [AiCoachModule, /* ... */] })
+   export class AppModule {}
+   ```
+
+4) Frontend: ensure your route `/Coach` renders `frontend/src/pages/Coach/index.tsx` and your UI kit alias paths (@/components/ui/*) map correctly.
+
+5) Try it with `AI_PROVIDER=mock` first. Then switch providers in env.
+
+## Notes
+- This bundle is privacy-safe; no keys or PII included.
+- The coach avoids suggesting IRL meetups or sharing personal contact info; keep hiring comms on-platform.
+- For streaming, you can extend `LlmProvider.complete` to server-sent events or WebSocket.
+
+EOF

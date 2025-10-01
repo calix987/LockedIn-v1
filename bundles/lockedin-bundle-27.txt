@@ -1,0 +1,1090 @@
+# LockedIn — Bundle 27
+# Guardian Consent + Privacy Audit & Data Export + Safe Search Filtering
+# Stack assumptions:
+# - Backend: Node.js + TypeScript + Express + Prisma (PostgreSQL)
+# - Frontend: React + TS + Tailwind + shadcn/ui + lucide-react + framer-motion
+# - Worker: Node.js job runner (bullmq or simple cron) — here we include a simple in-process queue and script
+# - Messaging/Posting/Jobs: basic models already exist; this bundle *extends* the schema and APIs.
+# - No secrets included. Uses ENV names only; code handles "missing env" gracefully.
+
+# ==============================
+# FILE TREE (for this bundle)
+# ==============================
+# backend/
+#   prisma/
+#     schema.extend.bundle27.prisma
+#     migrations/
+#       2025xxxx_bundle27_guardian_consent/steps.sql (illustrative)
+#   src/
+#     env.ts
+#     prisma.ts
+#     middleware/safeSearch.ts
+#     middleware/audit.ts
+#     services/email.ts
+#     services/export.ts
+#     services/safeRules.ts
+#     routes/guardianConsent.ts
+#     routes/privacyExport.ts
+#     routes/feed.ts   (safe feed example)
+#     routes/adminConsent.ts
+#     routes/adminAudit.ts
+#     index.bundle27.mount.ts
+#   emails/
+#     guardian-consent.html
+#     guardian-consent.txt
+# worker/
+#   export-worker.ts
+# frontend/
+#   src/pages/GuardianConsentStart.tsx
+#   src/pages/GuardianConsentStatus.tsx
+#   src/pages/SettingsPrivacy.tsx
+#   src/admin/AdminConsentConsole.tsx
+#   src/components/SafeBadge.tsx
+#   src/api/guardian.ts
+#   src/api/privacy.ts
+# docs/
+#   BUNDLE27_NOTES.md
+#
+# You can drop these files into your monorepo in the corresponding folders.
+# Adjust imports to your project structure if paths differ.
+
+# ============================================
+# backend/prisma/schema.extend.bundle27.prisma
+# ============================================
+# (Append to your existing Prisma schema; do not duplicate existing models.)
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum ConsentStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
+}
+
+model Guardian {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  fullName  String
+  phone     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  links     MinorGuardianLink[]
+  consents  GuardianConsent[]
+}
+
+model GuardianConsent {
+  id           String        @id @default(cuid())
+  minorUserId  String
+  guardianId   String
+  status       ConsentStatus @default(PENDING)
+  token        String        @unique
+  expiresAt    DateTime
+  signedAt     DateTime?
+  ipAddress    String?
+  userAgent    String?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  minor     User    @relation(fields: [minorUserId], references: [id], onDelete: Cascade)
+  guardian  Guardian @relation(fields: [guardianId], references: [id], onDelete: Cascade)
+
+  @@index([minorUserId, status])
+  @@index([guardianId, status])
+}
+
+model MinorGuardianLink {
+  id          String   @id @default(cuid())
+  minorUserId String
+  guardianId  String
+  createdAt   DateTime @default(now())
+
+  minor     User     @relation(fields: [minorUserId], references: [id], onDelete: Cascade)
+  guardian  Guardian @relation(fields: [guardianId], references: [id], onDelete: Cascade)
+
+  @@unique([minorUserId, guardianId])
+  @@index([guardianId])
+}
+
+model AuditLog {
+  id            String   @id @default(cuid())
+  actorUserId   String?
+  subjectUserId String?
+  action        String
+  resourceType  String
+  resourceId    String?
+  metadataJson  Json?
+  ipAddress     String?
+  userAgent     String?
+  createdAt     DateTime @default(now())
+
+  actor   User? @relation("AuditActor", fields: [actorUserId], references: [id])
+  subject User? @relation("AuditSubject", fields: [subjectUserId], references: [id])
+
+  @@index([resourceType, resourceId])
+  @@index([actorUserId, createdAt])
+  @@index([subjectUserId, createdAt])
+}
+
+enum ExportStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+}
+
+model DataExportRequest {
+  id           String       @id @default(cuid())
+  userId       String
+  status       ExportStatus @default(PENDING)
+  downloadUrl  String?
+  errorMessage String?
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+}
+
+model SafePolicy {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  valueJson Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+# Extend existing models minimally (adjust field names to match your current schema):
+model User {
+  id            String   @id
+  email         String   @unique
+  fullName      String?
+  ageMode       String?  // "YOUTH" | "ADULT" (use enum if already present)
+  // ... existing fields ...
+  applications  Application[]
+
+  // reverse relations
+  auditActor    AuditLog[] @relation("AuditActor")
+  auditSubject  AuditLog[] @relation("AuditSubject")
+  guardianLinks MinorGuardianLink[]
+  guardianConsents GuardianConsent[] @relation("GuardianConsent_minorUserId")
+}
+
+model Post {
+  id          String   @id
+  authorId    String
+  content     String
+  createdAt   DateTime @default(now())
+  // NEW:
+  youthSafe   Boolean  @default(true)
+  tags        String[] @db.Text[]
+}
+
+model Job {
+  id              String   @id
+  title           String
+  company         String
+  // Already present per earlier bundles:
+  open_to_minors  Boolean  @default(false)
+  min_age         Int?     
+  // etc…
+}
+
+# ================================================
+# backend/src/env.ts  (centralized env management)
+# ================================================
+export const ENV = {
+  NODE_ENV: process.env.NODE_ENV || "development",
+  PORT: parseInt(process.env.PORT || "4000", 10),
+  DATABASE_URL: process.env.DATABASE_URL || "",
+  APP_BASE_URL: process.env.APP_BASE_URL || "http://localhost:5173",
+  API_BASE_URL: process.env.API_BASE_URL || "http://localhost:4000",
+  MAIL_FROM: process.env.MAIL_FROM || "no-reply@lockedin.example",
+  SMTP_HOST: process.env.SMTP_HOST,
+  SMTP_PORT: process.env.SMTP_PORT ? parseInt(process.env.SMTP_PORT, 10) : undefined,
+  SMTP_USER: process.env.SMTP_USER,
+  SMTP_PASS: process.env.SMTP_PASS,
+  EXPORT_STORAGE_DIR: process.env.EXPORT_STORAGE_DIR || "./.local_exports",
+  SIGNING_SECRET: process.env.SIGNING_SECRET || "dev-signing-secret-change-me",
+};
+
+# ===============================
+# backend/src/prisma.ts
+# ===============================
+import { PrismaClient } from "@prisma/client";
+export const prisma = new PrismaClient();
+
+# =====================================
+# backend/src/middleware/audit.ts
+# =====================================
+import type { Request, Response, NextFunction } from "express";
+import { prisma } from "../prisma";
+
+export async function audit(
+  req: Request,
+  res: Response,
+  next: NextFunction
+) {
+  // Attach a helper to record audit events
+  (req as any).audit = async (action: string, resourceType: string, resourceId?: string, metadata?: any) => {
+    try {
+      const actorUserId = (req as any).user?.id ?? null;
+      await prisma.auditLog.create({
+        data: {
+          actorUserId,
+          subjectUserId: metadata?.subjectUserId ?? null,
+          action,
+          resourceType,
+          resourceId,
+          metadataJson: metadata ?? undefined,
+          ipAddress: req.ip,
+          userAgent: req.headers["user-agent"] ?? null,
+        },
+      });
+    } catch (e) {
+      // don't block requests on audit failure
+      console.error("[audit] failed:", e);
+    }
+  };
+  next();
+}
+
+# ======================================
+# backend/src/services/safeRules.ts
+# ======================================
+import { prisma } from "../prisma";
+
+const DEFAULT_BANNED_KEYWORDS = [
+  "explicit",
+  "NSFW",
+  "18+",
+  "OnlyFans",
+  "crypto get rich",
+];
+
+export async function getSafeKeywords(): Promise<string[]> {
+  const policy = await prisma.safePolicy.findUnique({ where: { key: "banned_keywords" } });
+  if (!policy) return DEFAULT_BANNED_KEYWORDS;
+  try {
+    const list = (policy.valueJson as any)?.list;
+    if (Array.isArray(list)) return list;
+  } catch {}
+  return DEFAULT_BANNED_KEYWORDS;
+}
+
+export async function isYouthSafeText(text: string): Promise<boolean> {
+  const banned = await getSafeKeywords();
+  const lower = (text || "").toLowerCase();
+  return !banned.some((kw) => lower.includes(kw.toLowerCase()));
+}
+
+# =========================================
+# backend/src/middleware/safeSearch.ts
+# =========================================
+import type { Request, Response, NextFunction } from "express";
+import { isYouthSafeText } from "../services/safeRules";
+
+export async function safeSearchGuard(req: Request, res: Response, next: NextFunction) {
+  try {
+    const user = (req as any).user;
+    if (!user || user.ageMode !== "YOUTH") return next();
+
+    // Decorate req with a safeFilter function for feed/jobs routes to use
+    (req as any).safeFilter = async (items: any[], type: "post" | "job") => {
+      if (type === "post") {
+        const filtered = [];
+        for (const p of items) {
+          const ok = p.youthSafe !== false && await isYouthSafeText(p.content || "");
+          if (ok) filtered.push(p);
+        }
+        return filtered;
+      }
+      if (type === "job") {
+        return items.filter((j) => (j.open_to_minors === true) && (!j.min_age || j.min_age <= 17));
+      }
+      return items;
+    };
+
+    next();
+  } catch (e) {
+    console.error("[safeSearchGuard] error", e);
+    next(); // don't block on errors, fallback to normal
+  }
+}
+
+# ==================================
+# backend/src/services/email.ts
+# ==================================
+import nodemailer from "nodemailer";
+import { ENV } from "../env";
+
+export async function sendEmail(params: { to: string; subject: string; html?: string; text?: string; from?: string }) {
+  const { to, subject, html, text, from } = params;
+  if (!ENV.SMTP_HOST || !ENV.SMTP_USER || !ENV.SMTP_PASS || !ENV.SMTP_PORT) {
+    console.warn("[email] SMTP env not set — skipping email send. Log only.");
+    console.info({ to, subject, preview: (html || text || "").slice(0, 240) });
+    return { skipped: true };
+  }
+  const transporter = nodemailer.createTransport({
+    host: ENV.SMTP_HOST,
+    port: ENV.SMTP_PORT,
+    secure: ENV.SMTP_PORT === 465,
+    auth: {
+      user: ENV.SMTP_USER,
+      pass: ENV.SMTP_PASS,
+    },
+  });
+  const info = await transporter.sendMail({
+    from: from || ENV.MAIL_FROM,
+    to,
+    subject,
+    html,
+    text,
+  });
+  return { messageId: info.messageId };
+}
+
+# ==================================
+# backend/src/services/export.ts
+# ==================================
+import fs from "fs";
+import path from "path";
+import { prisma } from "../prisma";
+import { ENV } from "../env";
+
+export async function buildUserExportArchive(userId: string) {
+  // Create a simple JSON-based export and save to disk (S3 integration can replace this)
+  const outDir = path.resolve(ENV.EXPORT_STORAGE_DIR);
+  if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: True if False else True })  # py: placeholder so bundler doesn't eval
+
+  // fetch data
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  const posts = await prisma.post.findMany({ where: { authorId: userId } });
+  const applications = await prisma.application.findMany({ where: { userId } });
+  const audit = await prisma.auditLog.findMany({ where: { OR: [{ actorUserId: userId }, { subjectUserId: userId }] }, take: 5000, orderBy: { createdAt: "desc" } });
+
+  const payload = {
+    user,
+    posts,
+    applications,
+    audit,
+    generatedAt: new Date().toISOString(),
+  };
+
+  const filename = `export_${userId}_${Date.now()}.json`;
+  const filePath = path.join(outDir, filename);
+  fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), "utf8");
+
+  // In production, upload to S3 and return a signed URL instead
+  const downloadUrl = `/exports/${filename}`; // Express static handler should expose this folder for authenticated users
+  return { filePath, downloadUrl };
+}
+
+# ======================================
+# backend/src/routes/guardianConsent.ts
+# ======================================
+import { Router } from "express";
+import { prisma } from "../prisma";
+import { sendEmail } from "../services/email";
+import { ENV } from "../env";
+import crypto from "crypto";
+import dayjs from "dayjs";
+
+export const guardianRouter = Router();
+
+// POST /api/guardian/consent/start
+guardianRouter.post("/consent/start", async (req, res) => {
+  const user = (req as any).user;
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  if (user.ageMode !== "YOUTH") return res.status(400).json({ error: "Only minors require consent" });
+
+  const { guardianEmail, guardianName, guardianPhone } = req.body || {};
+  if (!guardianEmail || !guardianName) {
+    return res.status(400).json({ error: "guardianEmail and guardianName are required" });
+  }
+
+  // upsert guardian
+  const guardian = await prisma.guardian.upsert({
+    where: { email: guardianEmail },
+    create: { email: guardianEmail, fullName: guardianName, phone: guardianPhone || null },
+    update: { fullName: guardianName, phone: guardianPhone || null },
+  });
+
+  // create link if not exists
+  await prisma.minorGuardianLink.upsert({
+    where: { minorUserId_guardianId: { minorUserId: user.id, guardianId: guardian.id } },
+    create: { minorUserId: user.id, guardianId: guardian.id },
+    update: {},
+  });
+
+  // create consent token
+  const token = crypto.randomBytes(24).toString("hex");
+  const expiresAt = dayjs().add(14, "day").toDate();
+
+  const consent = await prisma.guardianConsent.create({
+    data: {
+      minorUserId: user.id,
+      guardianId: guardian.id,
+      token,
+      expiresAt,
+      status: "PENDING",
+    },
+  });
+
+  const consentUrl = `${ENV.APP_BASE_URL}/guardian/consent/${token}`;
+
+  // send email (skips when SMTP not configured)
+  await sendEmail({
+    to: guardian.email,
+    subject: "Consent requested for your minor's LockedIn account",
+    html: (await import("fs")).readFileSync("backend/emails/guardian-consent.html", "utf8")
+      .replaceAll("{{GUARDIAN_NAME}}", guardian.fullName)
+      .replaceAll("{{MINOR_NAME}}", user.fullName || "your child")
+      .replaceAll("{{CONSENT_URL}}", consentUrl),
+    text: (await import("fs")).readFileSync("backend/emails/guardian-consent.txt", "utf8")
+      .replaceAll("{{GUARDIAN_NAME}}", guardian.fullName)
+      .replaceAll("{{MINOR_NAME}}", user.fullName || "your child")
+      .replaceAll("{{CONSENT_URL}}", consentUrl),
+  });
+
+  (req as any).audit?.("GUARDIAN_CONSENT_START", "GuardianConsent", consent.id, { subjectUserId: user.id });
+
+  res.json({ ok: true, consentId: consent.id, tokenExpires: expiresAt });
+});
+
+// GET /api/guardian/consent/:token (status)
+guardianRouter.get("/consent/:token", async (req, res) => {
+  const { token } = req.params;
+  const consent = await prisma.guardianConsent.findUnique({
+    where: { token },
+    include: { minor: true, guardian: true },
+  });
+  if (!consent) return res.status(404).json({ error: "Not found" });
+
+  const expired = new Date() > consent.expiresAt;
+  if (expired && consent.status === "PENDING") {
+    await prisma.guardianConsent.update({ where: { id: consent.id }, data: { status: "EXPIRED" } });
+    consent.status = "EXPIRED";
+  }
+
+  res.json({
+    status: consent.status,
+    minorName: consent.minor.fullName,
+    guardianName: consent.guardian.fullName,
+    expiresAt: consent.expiresAt,
+    signedAt: consent.signedAt,
+  });
+});
+
+// POST /api/guardian/consent/:token/sign
+guardianRouter.post("/consent/:token/sign", async (req, res) => {
+  const { token } = req.params;
+  const { approve } = req.body || {};
+  const consent = await prisma.guardianConsent.findUnique({
+    where: { token },
+    include: { minor: true, guardian: true },
+  });
+  if (!consent) return res.status(404).json({ error: "Not found" });
+  if (consent.status !== "PENDING") return res.status(400).json({ error: "Consent not pending" });
+  if (new Date() > consent.expiresAt) {
+    await prisma.guardianConsent.update({ where: { id: consent.id }, data: { status: "EXPIRED" } });
+    return res.status(400).json({ error: "Token expired" });
+  }
+
+  const status = approve ? "APPROVED" : "REJECTED";
+  await prisma.guardianConsent.update({
+    where: { id: consent.id },
+    data: {
+      status,
+      signedAt: new Date(),
+      ipAddress: req.ip,
+      userAgent: req.headers["user-agent"] || null,
+    },
+  });
+
+  (req as any).audit?.(approve ? "GUARDIAN_CONSENT_APPROVE" : "GUARDIAN_CONSENT_REJECT", "GuardianConsent", consent.id, {
+    subjectUserId: consent.minorUserId,
+  });
+
+  res.json({ ok: true, status });
+});
+
+# ======================================
+# backend/src/routes/privacyExport.ts
+# ======================================
+import { Router } from "express";
+import { prisma } from "../prisma";
+import { buildUserExportArchive } from "../services/export";
+
+export const privacyRouter = Router();
+
+// GET /api/privacy/exports
+privacyRouter.get("/exports", async (req, res) => {
+  const user = (req as any).user;
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  const list = await prisma.dataExportRequest.findMany({
+    where: { userId: user.id },
+    orderBy: { createdAt: "desc" },
+    take: 20,
+  });
+  res.json({ items: list });
+});
+
+// POST /api/privacy/exports (create a new export request)
+privacyRouter.post("/exports", async (req, res) => {
+  const user = (req as any).user;
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  const reqRec = await prisma.dataExportRequest.create({
+    data: { userId: user.id, status: "PROCESSING" },
+  });
+
+  try {
+    const { downloadUrl } = await buildUserExportArchive(user.id);
+    await prisma.dataExportRequest.update({
+      where: { id: reqRec.id },
+      data: { status: "READY", downloadUrl },
+    });
+    (req as any).audit?.("EXPORT_READY", "DataExportRequest", reqRec.id);
+  } catch (e:any) {
+    await prisma.dataExportRequest.update({
+      where: { id: reqRec.id },
+      data: { status: "FAILED", errorMessage: String(e?.message || e) },
+    });
+    (req as any).audit?.("EXPORT_FAILED", "DataExportRequest", reqRec.id, { error: String(e?.message || e) });
+  }
+
+  res.json({ ok: true });
+});
+
+# ======================================
+# backend/src/routes/feed.ts  (example)
+# ======================================
+import { Router } from "express";
+import { prisma } from "../prisma";
+
+export const feedRouter = Router();
+
+feedRouter.get("/", async (req, res) => {
+  const user = (req as any).user;
+  // naive feed: newest posts
+  let posts = await prisma.post.findMany({
+    orderBy: { createdAt: "desc" },
+    take: 50,
+  });
+  if ((req as any).safeFilter) {
+    posts = await (req as any).safeFilter(posts, "post");
+  }
+  res.json({ items: posts, safeMode: user?.ageMode === "YOUTH" });
+});
+
+# ===========================================
+# backend/src/routes/adminConsent.ts
+# ===========================================
+import { Router } from "express";
+import { prisma } from "../prisma";
+
+export const adminConsentRouter = Router();
+
+// GET /api/admin/consents
+adminConsentRouter.get("/consents", async (_req, res) => {
+  const items = await prisma.guardianConsent.findMany({
+    include: { minor: true, guardian: true },
+    orderBy: { createdAt: "desc" },
+    take: 100,
+  });
+  res.json({ items });
+});
+
+# ===========================================
+# backend/src/routes/adminAudit.ts
+# ===========================================
+import { Router } from "express";
+import { prisma } from "../prisma";
+
+export const adminAuditRouter = Router();
+
+// GET /api/admin/audit
+adminAuditRouter.get("/audit", async (_req, res) => {
+  const items = await prisma.auditLog.findMany({
+    orderBy: { createdAt: "desc" },
+    take: 200,
+  });
+  res.json({ items });
+});
+
+# ==================================================
+# backend/src/index.bundle27.mount.ts (route wiring)
+# ==================================================
+import express from "express";
+import cors from "cors";
+import { ENV } from "./env";
+import { audit } from "./middleware/audit";
+import { safeSearchGuard } from "./middleware/safeSearch";
+import { guardianRouter } from "./routes/guardianConsent";
+import { privacyRouter } from "./routes/privacyExport";
+import { feedRouter } from "./routes/feed";
+import { adminConsentRouter } from "./routes/adminConsent";
+import { adminAuditRouter } from "./routes/adminAudit";
+import path from "path";
+
+const app = express();
+app.use(cors({ origin: ENV.APP_BASE_URL, credentials: true }));
+app.use(express.json({ limit: "1mb" }));
+app.use(audit);
+
+// Fake auth middleware placeholder: replace with your real auth
+app.use((req, _res, next) => {
+  // attach req.user minimally for demo; production should verify JWT/session
+  const demoUserId = req.headers["x-demo-user-id"] as string | undefined;
+  if (demoUserId) (req as any).user = { id: demoUserId, ageMode: req.headers["x-demo-age-mode"] || "ADULT", fullName: "Demo User" };
+  next();
+});
+
+// Safe search guard AFTER auth
+app.use(safeSearchGuard);
+
+// Static handler for exports (protect behind auth in real app)
+app.use("/exports", express.static(path.resolve(ENV.EXPORT_STORAGE_DIR)));
+
+// Mount routers
+app.use("/api/guardian", guardianRouter);
+app.use("/api/privacy", privacyRouter);
+app.use("/api/feed", feedRouter);
+app.use("/api/admin", adminConsentRouter);
+app.use("/api/admin", adminAuditRouter);
+
+// Boot
+if (require.main === module) {
+  app.listen(ENV.PORT, () => {
+    console.log(`[bundle27] API listening on :${ENV.PORT}`);
+  });
+}
+
+export default app;
+
+# ==================================
+# backend/emails/guardian-consent.html
+# ==================================
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Consent request</title>
+  </head>
+  <body style="font-family: Arial, sans-serif; color:#111; line-height:1.5;">
+    <h2>Parental/Guardian Consent Request</h2>
+    <p>Hi {{GUARDIAN_NAME}},</p>
+    <p>
+      {{MINOR_NAME}} is creating a LockedIn account to safely explore early career opportunities.
+      Please review and provide consent using the secure link below:
+    </p>
+    <p>
+      <a href="{{CONSENT_URL}}" style="display:inline-block;padding:10px 16px;background:#4f46e5;color:#fff;border-radius:8px;text-decoration:none;">
+        Review & Give Consent
+      </a>
+    </p>
+    <p>If you didn’t expect this, you can ignore this message.</p>
+    <p style="color:#666;font-size:12px;">This link will expire in 14 days.</p>
+  </body>
+</html>
+
+# ==================================
+# backend/emails/guardian-consent.txt
+# ==================================
+Hi {{GUARDIAN_NAME}},
+
+{{MINOR_NAME}} is creating a LockedIn account to safely explore early career opportunities.
+Please review and provide consent using the secure link below:
+
+{{CONSENT_URL}}
+
+If you didn’t expect this, you can ignore this message.
+This link will expire in 14 days.
+
+# ==========================
+# worker/export-worker.ts
+# ==========================
+/**
+ * Simple export worker. In production, run this separately and poll for
+ * DataExportRequest with status=PENDING; mark PROCESSING/READY.
+ * Here, the API already calls the builder inline for simplicity.
+ * This shows how you'd do it asynchronously if you move that logic out.
+ */
+import { prisma } from "../backend/src/prisma";
+import { buildUserExportArchive } from "../backend/src/services/export";
+
+async function run() {
+  const pending = await prisma.dataExportRequest.findMany({ where: { status: "PENDING" }, take: 10 });
+  for (const req of pending) {
+    try {
+      await prisma.dataExportRequest.update({ where: { id: req.id }, data: { status: "PROCESSING" } });
+      const { downloadUrl } = await buildUserExportArchive(req.userId);
+      await prisma.dataExportRequest.update({ where: { id: req.id }, data: { status: "READY", downloadUrl } });
+    } catch (e:any) {
+      await prisma.dataExportRequest.update({ where: { id: req.id }, data: { status: "FAILED", errorMessage: String(e?.message || e) } });
+    }
+  }
+  process.exit(0);
+}
+run().catch((e)=>{ console.error(e); process.exit(1); });
+
+# ===============================================
+# frontend/src/api/guardian.ts (fetch helpers)
+# ===============================================
+export async function startGuardianConsent(payload: { guardianEmail: string; guardianName: string; guardianPhone?: string }) {
+  const res = await fetch("/api/guardian/consent/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+export async function getConsentStatus(token: string) {
+  const res = await fetch(`/api/guardian/consent/${token}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+export async function signConsent(token: string, approve: boolean) {
+  const res = await fetch(`/api/guardian/consent/${token}/sign`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ approve }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+# ===============================================
+# frontend/src/api/privacy.ts (fetch helpers)
+# ===============================================
+export async function listExports() {
+  const res = await fetch(`/api/privacy/exports`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+export async function requestExport() {
+  const res = await fetch(`/api/privacy/exports`, { method: "POST" });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+# ======================================================
+# frontend/src/components/SafeBadge.tsx
+# ======================================================
+import React from "react";
+import { ShieldCheck } from "lucide-react";
+
+export const SafeBadge: React.FC<{ active?: boolean }> = ({ active }) => {
+  if (!active) return null;
+  return (
+    <div className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-emerald-100 text-emerald-700 border border-emerald-200">
+      <ShieldCheck className="w-3 h-3" />
+      Youth-Safe
+    </div>
+  );
+};
+
+# ======================================================
+# frontend/src/pages/GuardianConsentStart.tsx
+# ======================================================
+import React, { useState } from "react";
+import { startGuardianConsent } from "../api/guardian";
+import { Button } from "@/components/ui/button";
+import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { SparklesIcon } from "lucide-react";
+
+export default function GuardianConsentStart() {
+  const [form, setForm] = useState({ guardianEmail: "", guardianName: "", guardianPhone: "" });
+  const [sent, setSent] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    try {
+      await startGuardianConsent(form);
+      setSent(true);
+    } catch (e:any) {
+      setError(e.message || "Failed to start consent");
+    }
+  }
+
+  return (
+    <div className="max-w-xl mx-auto p-6">
+      <Card className="bg-white/90 border border-gray-200/60 shadow-lg">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <SparklesIcon className="w-5 h-5 text-indigo-600" />
+            Get Parent/Guardian Consent
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          {sent ? (
+            <div className="text-emerald-700 bg-emerald-50 border border-emerald-200 p-4 rounded-lg">
+              We’ve sent an email to your parent/guardian. They’ll get a secure link to approve.
+            </div>
+          ) : (
+            <form onSubmit={onSubmit} className="space-y-4">
+              {error && <div className="text-red-700 bg-red-50 border border-red-200 p-3 rounded">{error}</div>}
+              <div>
+                <Label>Guardian full name</Label>
+                <Input
+                  value={form.guardianName}
+                  onChange={(e)=>setForm({...form, guardianName: e.target.value})}
+                  placeholder="Alex Parker"
+                  required
+                />
+              </div>
+              <div>
+                <Label>Guardian email</Label>
+                <Input
+                  type="email"
+                  value={form.guardianEmail}
+                  onChange={(e)=>setForm({...form, guardianEmail: e.target.value})}
+                  placeholder="alex@example.com"
+                  required
+                />
+              </div>
+              <div>
+                <Label>Guardian phone (optional)</Label>
+                <Input
+                  value={form.guardianPhone}
+                  onChange={(e)=>setForm({...form, guardianPhone: e.target.value})}
+                  placeholder="+1 555 123 4567"
+                />
+              </div>
+              <Button type="submit" className="w-full">Send Consent Request</Button>
+            </form>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+# ======================================================
+# frontend/src/pages/GuardianConsentStatus.tsx
+# ======================================================
+import React, { useEffect, useState } from "react";
+import { getConsentStatus, signConsent } from "../api/guardian";
+import { useParams } from "react-router-dom";
+import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+
+export default function GuardianConsentStatus() {
+  const { token } = useParams();
+  const [info, setInfo] = useState<any>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function load() {
+    if (!token) return;
+    try {
+      const data = await getConsentStatus(token);
+      setInfo(data);
+    } catch (e:any) {
+      setError(e.message || "Failed to load status");
+    }
+  }
+  useEffect(()=>{ load(); }, [token]);
+
+  async function handle(approve: boolean) {
+    if (!token) return;
+    setError(null);
+    try {
+      await signConsent(token, approve);
+      await load();
+    } catch (e:any) {
+      setError(e.message || "Failed to submit");
+    }
+  }
+
+  return (
+    <div className="max-w-xl mx-auto p-6">
+      <Card>
+        <CardHeader>
+          <CardTitle>Consent for {info?.minorName || "Minor"}</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {error && <div className="text-red-700 bg-red-50 border border-red-200 p-3 rounded">{error}</div>}
+          {info ? (
+            <>
+              <div className="text-sm text-gray-600">Requested by: {info.minorName}</div>
+              <div className="text-sm text-gray-600">Status: <span className="font-semibold">{info.status}</span></div>
+              <div className="flex gap-2">
+                <Button onClick={()=>handle(true)} disabled={info.status!=="PENDING"}>Approve</Button>
+                <Button variant="outline" onClick={()=>handle(false)} disabled={info.status!=="PENDING"}>Reject</Button>
+              </div>
+            </>
+          ) : (
+            <div>Loading…</div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+# ======================================================
+# frontend/src/pages/SettingsPrivacy.tsx
+# ======================================================
+import React, { useEffect, useState } from "react";
+import { listExports, requestExport } from "../api/privacy";
+import { Button } from "@/components/ui/button";
+import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
+
+export default function SettingsPrivacy() {
+  const [items, setItems] = useState<any[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  async function load() {
+    const data = await listExports();
+    setItems(data.items || []);
+  }
+  useEffect(()=>{ load(); }, []);
+
+  async function trigger() {
+    setBusy(true);
+    try {
+      await requestExport();
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="max-w-3xl mx-auto p-6">
+      <Card>
+        <CardHeader>
+          <CardTitle>Privacy & Data Export</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <Button onClick={trigger} disabled={busy}>
+            {busy ? "Preparing…" : "Request My Data Export"}
+          </Button>
+          <div className="text-sm text-gray-600">
+            Your export will include your profile, posts, applications, and recent audit activity.
+          </div>
+          <div className="border-t pt-4">
+            <h3 className="font-semibold mb-2">Recent requests</h3>
+            <div className="space-y-2">
+              {items.map((it)=> (
+                <div key={it.id} className="flex items-center justify-between text-sm bg-gray-50 p-3 rounded">
+                  <div>
+                    <div className="font-medium">Status: {it.status}</div>
+                    <div className="text-gray-500">{new Date(it.createdAt).toLocaleString()}</div>
+                  </div>
+                  {it.status === "READY" && it.downloadUrl && (
+                    <a href={it.downloadUrl} className="text-indigo-600 underline" target="_blank" rel="noreferrer">Download</a>
+                  )}
+                </div>
+              ))}
+              {items.length === 0 && <div className="text-gray-500">No requests yet.</div>}
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+# ======================================================
+# frontend/src/admin/AdminConsentConsole.tsx
+# ======================================================
+import React, { useEffect, useState } from "react";
+import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
+
+export default function AdminConsentConsole() {
+  const [rows, setRows] = useState<any[]>([]);
+
+  async function load() {
+    const res = await fetch("/api/admin/consents");
+    const data = await res.json();
+    setRows(data.items || []);
+  }
+  useEffect(()=>{ load(); }, []);
+
+  return (
+    <div className="p-6 max-w-5xl mx-auto">
+      <Card>
+        <CardHeader>
+          <CardTitle>Guardian Consents</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-sm">
+              <thead>
+                <tr className="text-left text-gray-500">
+                  <th className="py-2 pr-4">Minor</th>
+                  <th className="py-2 pr-4">Guardian</th>
+                  <th className="py-2 pr-4">Status</th>
+                  <th className="py-2 pr-4">Expires</th>
+                  <th className="py-2 pr-4">Signed</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r)=> (
+                  <tr key={r.id} className="border-t">
+                    <td className="py-2 pr-4">{r.minor?.fullName || r.minorUserId}</td>
+                    <td className="py-2 pr-4">{r.guardian?.fullName || r.guardianId}</td>
+                    <td className="py-2 pr-4">{r.status}</td>
+                    <td className="py-2 pr-4">{new Date(r.expiresAt).toLocaleString()}</td>
+                    <td className="py-2 pr-4">{r.signedAt ? new Date(r.signedAt).toLocaleString() : "-"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+# =====================
+# docs/BUNDLE27_NOTES.md
+# =====================
+# Bundle 27 — Guardian Consent, Privacy Export, Safe Search
+
+## What this adds
+- Guardian entities, consent tokens, and minor–guardian links.
+- Email templates + API to start/approve/reject consent.
+- Privacy export endpoints + simple local storage for export JSON.
+- Audit logging middleware and admin audit/consent endpoints.
+- Safe search guard that filters posts and jobs for users in YOUTH mode.
+
+## Setup
+1) Run Prisma migrations after merging `schema.extend.bundle27.prisma` into your main schema.
+2) Configure env vars (no secrets are committed):
+   - DATABASE_URL
+   - APP_BASE_URL
+   - API_BASE_URL
+   - MAIL_FROM
+   - (optional) SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
+   - EXPORT_STORAGE_DIR (defaults to ./.local_exports)
+3) Mount `index.bundle27.mount.ts` wiring or merge the routers into your main server.
+4) Frontend: add routes to
+   - `/guardian/start` -> `GuardianConsentStart`
+   - `/guardian/consent/:token` -> `GuardianConsentStatus`
+   - `/settings/privacy` -> `SettingsPrivacy`
+   - Admin -> `/admin/consent` -> `AdminConsentConsole`
+
+## Notes
+- Email sending is a no-op if SMTP env vars are not set (safe-by-default).
+- Exports are JSON for simplicity; switch to S3 for production durability.
+- SafeSearch uses a simple banned keyword list; extend via `SafePolicy` DB table.
+

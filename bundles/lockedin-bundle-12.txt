@@ -1,0 +1,1109 @@
+# LockedIn — Bundle 12 (Candidate Job Discovery & Search v2)
+# ---------------------------------------------------------------------------------
+# This bundle wires up full-stack job search & discovery with robust filters,
+# relevance sorting, saved jobs, and a Job Detail view.
+#
+# Drop these files into your repo following the === path: ... === headers.
+# Run: 
+#   - prisma migrate dev --name add_saved_jobs_and_indexes
+#   - (re)start API + web
+# No secrets included. Replace any auth stub with your middleware.
+#
+# Depends on Bundles 00–11 (core monorepo structure + Employer Jobs).
+#
+# Highlights
+# - Backend: /search/jobs endpoint with query, filters, sort, pagination
+# - Backend: /users/me/saved-jobs CRUD
+# - Prisma: SavedJob model + indexes on Job for fast search
+# - SDK: Jobs.search, Jobs.save, Jobs.unsave, Jobs.savedList
+# - Web: Jobs page upgraded to server data, filters, infinite scroll
+# - Web: Job Detail page with save/apply & youth-safety ribbons
+#
+# ---------------------------------------------------------------------------------
+
+=== path: prisma/schema.prisma ===
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                 String      @id @default(cuid())
+  email              String      @unique
+  fullName           String?
+  ageMode            String?     // 'YOUTH' | 'ADULT'
+  skills             String[]
+  country            String?
+  city               String?
+  availabilityHours  Int?
+  targetSalary       Int?
+  createdAt          DateTime    @default(now())
+  updatedAt          DateTime    @updatedAt
+
+  applications       Application[]
+  savedJobs          SavedJob[]
+}
+
+model Company {
+  id              String     @id @default(cuid())
+  name            String
+  verified        Boolean    @default(false)
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  jobs            Job[]
+}
+
+enum LocationType {
+  REMOTE
+  ONSITE
+  HYBRID
+}
+
+enum PayType {
+  HOURLY
+  SALARY
+  STIPEND
+}
+
+enum ExperienceLevel {
+  ENTRY
+  JUNIOR
+  MID
+  SENIOR
+}
+
+model Job {
+  id               String           @id @default(cuid())
+  title            String
+  companyId        String
+  company          Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  description      String
+  locationType     LocationType
+  locations        String[]
+  payMin           Int?
+  payMax           Int?
+  payType          PayType?
+  currency         String           @default("USD")
+  experienceLevel  ExperienceLevel
+  minAge           Int?             // >= 13 if set
+  openToMinors     Boolean          @default(false)
+  requiredSkills   String[]
+  preferredSkills  String[]
+  benefits         String[]
+  requirements     String[]
+  applicationUrl   String?
+  verifiedPay      Boolean          @default(false)
+  tags             String[]
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  verifiedCompany  Boolean          @default(false)
+
+  applications     Application[]
+  savedBy          SavedJob[]
+
+  @@index([companyId])
+  @@index([experienceLevel])
+  @@index([locationType])
+  @@index([verifiedCompany])
+  @@index([openToMinors])
+  // Text search helpers (Postgres): title, tags, description
+  @@index([title])
+}
+
+model Application {
+  id            String   @id @default(cuid())
+  jobId         String
+  userId        String
+  status        String
+  coverLetter   String?
+  fitScore      Int?
+  keywordMatches String[]
+  missingKeywords String[]
+  notes         String?
+  interviewDate DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  job           Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([jobId])
+  @@index([status])
+}
+
+model SavedJob {
+  id        String   @id @default(cuid())
+  userId    String
+  jobId     String
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  job       Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, jobId])
+  @@index([userId])
+  @@index([jobId])
+}
+
+=== path: prisma/migrations/2025XXXX_add_saved_jobs_and_indexes/migration.sql ===
+-- This is a reference migration; Prisma will generate one similar. 
+-- If creating manually, ensure tables/columns match schema.prisma.
+
+-- Example for Postgres (idempotent-ish guards omitted for brevity).
+
+-- SavedJob table
+CREATE TABLE IF NOT EXISTS "SavedJob" (
+  "id" TEXT PRIMARY KEY,
+  "userId" TEXT NOT NULL,
+  "jobId" TEXT NOT NULL,
+  "createdAt" TIMESTAMP NOT NULL DEFAULT NOW(),
+  CONSTRAINT "SavedJob_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT "SavedJob_jobId_fkey" FOREIGN KEY ("jobId") REFERENCES "Job"("id") ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS "SavedJob_userId_jobId_key" ON "SavedJob"("userId","jobId");
+CREATE INDEX IF NOT EXISTS "SavedJob_userId_idx" ON "SavedJob"("userId");
+CREATE INDEX IF NOT EXISTS "SavedJob_jobId_idx" ON "SavedJob"("jobId");
+
+-- Add helpful indexes for Job
+CREATE INDEX IF NOT EXISTS "Job_title_idx" ON "Job"("title");
+CREATE INDEX IF NOT EXISTS "Job_tags_idx" ON "Job" USING GIN (to_tsvector('simple', array_to_string("tags", ' ')));
+CREATE INDEX IF NOT EXISTS "Job_desc_trgm_idx" ON "Job" USING GIN (to_tsvector('english', "description"));
+
+=== path: apps/api/src/utils/search.ts ===
+import { Job, PrismaClient } from "@prisma/client";
+const prisma = new PrismaClient();
+
+type SearchInput = {
+  q?: string;
+  page?: number;
+  pageSize?: number;
+  sort?: "relevance" | "recent" | "pay_high" | "pay_low";
+  filters?: {
+    experienceLevel?: string[]; // ["ENTRY","JUNIOR",...]
+    locationType?: string[];    // ["REMOTE","ONSITE","HYBRID"]
+    payType?: string[];         // ["SALARY","HOURLY","STIPEND"]
+    minPay?: number;
+    maxPay?: number;
+    verifiedCompany?: boolean;
+    openToMinors?: boolean;
+    tags?: string[];
+  };
+  userAgeMode?: "YOUTH" | "ADULT";
+};
+
+export async function searchJobs(input: SearchInput) {
+  const {
+    q,
+    page = 1,
+    pageSize = 20,
+    sort = "relevance",
+    filters = {},
+    userAgeMode
+  } = input;
+
+  // Youth safety: enforce openToMinors for YOUTH.
+  const enforcedOpenToMinors = userAgeMode === "YOUTH" ? true : filters.openToMinors;
+
+  const where: any = {
+    ...(filters.experienceLevel?.length ? { experienceLevel: { in: filters.experienceLevel as any } } : {}),
+    ...(filters.locationType?.length ? { locationType: { in: filters.locationType as any } } : {}),
+    ...(filters.payType?.length ? { payType: { in: filters.payType as any } } : {}),
+    ...(typeof filters.verifiedCompany === "boolean" ? { verifiedCompany: filters.verifiedCompany } : {}),
+    ...(typeof enforcedOpenToMinors === "boolean" ? { openToMinors: enforcedOpenToMinors } : {}),
+    ...(filters.tags?.length ? { tags: { hasSome: filters.tags } } : {}),
+    ...(filters.minPay || filters.maxPay
+      ? {
+          OR: [
+            {
+              AND: [
+                filters.minPay ? { payMin: { gte: filters.minPay } } : {},
+                filters.maxPay ? { payMax: { lte: filters.maxPay } } : {},
+              ],
+            },
+            // If payMin/payMax missing on some jobs, keep them unless strictly filtered out
+            { payMin: null, payMax: null },
+          ],
+        }
+      : {}),
+  };
+
+  // Basic keyword search: match title/company via contains (use ILIKE via Prisma mode insensitive)
+  // For more advanced, introduce a tsvector/materialized view later.
+  const keywordClause = q
+    ? {
+        OR: [
+          { title: { contains: q, mode: "insensitive" as const } },
+          // Join to company with nested where
+          { company: { name: { contains: q, mode: "insensitive" as const } } as any },
+          { tags: { has: q } },
+          { description: { contains: q, mode: "insensitive" as const } },
+        ],
+      }
+    : {};
+
+  const finalWhere = { ...where, ...keywordClause };
+
+  let orderBy: any = { createdAt: "desc" };
+  if (sort === "pay_high") orderBy = { payMax: "desc" };
+  if (sort === "pay_low") orderBy = { payMin: "asc" };
+  // relevance: we compute a naive score after fetch; still order by recency for tie-breakers
+
+  const skip = (page - 1) * pageSize;
+  const take = pageSize;
+
+  const [items, total] = await Promise.all([
+    prisma.job.findMany({
+      where: finalWhere,
+      include: { company: true },
+      orderBy,
+      skip,
+      take,
+    }),
+    prisma.job.count({ where: finalWhere }),
+  ]);
+
+  const withScore = items.map((job) => ({
+    job,
+    score: relevanceScore(job, q || "", filters),
+  }));
+
+  const ranked =
+    sort === "relevance"
+      ? withScore.sort((a, b) => b.score - a.score || (b.job.createdAt?.getTime?.() || 0) - (a.job.createdAt?.getTime?.() || 0))
+      : withScore;
+
+  return {
+    total,
+    page,
+    pageSize,
+    results: ranked.map((r) => r.job),
+  };
+}
+
+function relevanceScore(job: Job & { company?: any }, q: string, filters: SearchInput["filters"] = {}) {
+  if (!q) return 0.5; // neutral base when no q
+  const Q = q.toLowerCase();
+  const str = `${job.title} ${job.description} ${job.tags.join(" ")} ${job.company?.name ?? ""}`.toLowerCase();
+
+  let score = 0;
+  if (str.includes(Q)) score += 1.5;
+  // Bonus for title/company matches
+  if (job.title.toLowerCase().includes(Q)) score += 1.5;
+  if ((job.company?.name ?? "").toLowerCase().includes(Q)) score += 1.0;
+
+  // Soft bonus for tag intersections
+  if (filters?.tags?.length) {
+    const overlap = job.tags.filter((t) => filters.tags!.includes(t)).length;
+    score += overlap * 0.25;
+  }
+
+  // Slight bump if verified + openToMinors when applicable
+  if (job.verifiedCompany) score += 0.3;
+  if (job.openToMinors) score += 0.3;
+
+  return score;
+}
+
+=== path: apps/api/src/routes/search.ts ===
+import { Router } from "express";
+import { searchJobs } from "../utils/search";
+
+// Replace this with your real auth middleware.
+// It should populate req.user = { id, ageMode, ... }
+function requireAuth(req: any, _res: any, next: any) {
+  // TODO: Wire in real auth
+  req.user = req.user || { id: "demo-user", ageMode: "ADULT" };
+  next();
+}
+
+export const searchRouter = Router();
+
+searchRouter.get("/jobs", requireAuth, async (req: any, res) => {
+  try {
+    const q = (req.query.q as string) || undefined;
+    const page = parseInt((req.query.page as string) || "1", 10);
+    const pageSize = Math.min(50, parseInt((req.query.pageSize as string) || "20", 10));
+    const sort = (req.query.sort as string) as any;
+
+    const filters: any = {};
+    if (req.query.experienceLevel) {
+      filters.experienceLevel = String(req.query.experienceLevel).split(",");
+    }
+    if (req.query.locationType) {
+      filters.locationType = String(req.query.locationType).split(",");
+    }
+    if (req.query.payType) {
+      filters.payType = String(req.query.payType).split(",");
+    }
+    if (typeof req.query.verifiedCompany !== "undefined") {
+      filters.verifiedCompany = req.query.verifiedCompany === "true";
+    }
+    if (typeof req.query.openToMinors !== "undefined") {
+      filters.openToMinors = req.query.openToMinors === "true";
+    }
+    if (req.query.tags) {
+      filters.tags = String(req.query.tags).split(",");
+    }
+    if (req.query.minPay) filters.minPay = parseInt(String(req.query.minPay), 10);
+    if (req.query.maxPay) filters.maxPay = parseInt(String(req.query.maxPay), 10);
+
+    const data = await searchJobs({
+      q,
+      page,
+      pageSize,
+      sort,
+      filters,
+      userAgeMode: req.user?.ageMode,
+    });
+
+    res.json(data);
+  } catch (err: any) {
+    console.error(err);
+    res.status(500).json({ error: "SEARCH_ERROR", message: err?.message || "Unknown error" });
+  }
+});
+
+=== path: apps/api/src/routes/savedJobs.ts ===
+import { Router } from "express";
+import { PrismaClient } from "@prisma/client";
+const prisma = new PrismaClient();
+
+function requireAuth(req: any, _res: any, next: any) {
+  // TODO: Wire in real auth
+  req.user = req.user || { id: "demo-user", ageMode: "ADULT" };
+  next();
+}
+
+export const savedJobsRouter = Router();
+
+// List saved jobs for current user
+savedJobsRouter.get("/users/me/saved-jobs", requireAuth, async (req: any, res) => {
+  try {
+    const userId = req.user.id;
+    const saved = await prisma.savedJob.findMany({
+      where: { userId },
+      include: { job: { include: { company: true } } },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json(saved);
+  } catch (err: any) {
+    res.status(500).json({ error: "LIST_SAVED_ERROR", message: err?.message || "Unknown error" });
+  }
+});
+
+// Save a job
+savedJobsRouter.post("/jobs/:id/save", requireAuth, async (req: any, res) => {
+  try {
+    const userId = req.user.id;
+    const jobId = req.params.id;
+    const saved = await prisma.savedJob.upsert({
+      where: { userId_jobId: { userId, jobId } },
+      create: { userId, jobId },
+      update: {},
+    });
+    res.json(saved);
+  } catch (err: any) {
+    res.status(500).json({ error: "SAVE_ERROR", message: err?.message || "Unknown error" });
+  }
+});
+
+// Unsave a job
+savedJobsRouter.delete("/jobs/:id/save", requireAuth, async (req: any, res) => {
+  try {
+    const userId = req.user.id;
+    const jobId = req.params.id;
+    await prisma.savedJob.delete({
+      where: { userId_jobId: { userId, jobId } },
+    });
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ error: "UNSAVE_ERROR", message: err?.message || "Unknown error" });
+  }
+});
+
+=== path: apps/api/src/server.ts (patch) ===
+// ...existing imports
+import express from "express";
+import cors from "cors";
+
+import { searchRouter } from "./routes/search";
+import { savedJobsRouter } from "./routes/savedJobs";
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// ...existing routers
+app.use("/search", searchRouter);
+app.use("/", savedJobsRouter);
+
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`API listening on ${PORT}`);
+});
+
+=== path: packages/sdk/src/jobs.ts ===
+export type JobFilters = {
+  experienceLevel?: string[];
+  locationType?: string[];
+  payType?: string[];
+  minPay?: number;
+  maxPay?: number;
+  verifiedCompany?: boolean;
+  openToMinors?: boolean;
+  tags?: string[];
+};
+
+export type JobSearchParams = {
+  q?: string;
+  page?: number;
+  pageSize?: number;
+  sort?: "relevance" | "recent" | "pay_high" | "pay_low";
+  filters?: JobFilters;
+};
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8080";
+
+function qs(obj: Record<string, any>) {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === undefined || v === null) continue;
+    if (Array.isArray(v)) p.set(k, v.join(","));
+    else p.set(k, String(v));
+  }
+  return p.toString();
+}
+
+export class Jobs {
+  static async search(params: JobSearchParams) {
+    const query: any = {};
+    if (params.q) query.q = params.q;
+    if (params.page) query.page = params.page;
+    if (params.pageSize) query.pageSize = params.pageSize;
+    if (params.sort) query.sort = params.sort;
+    if (params.filters) {
+      const f = params.filters;
+      if (f.experienceLevel) query.experienceLevel = f.experienceLevel;
+      if (f.locationType) query.locationType = f.locationType;
+      if (f.payType) query.payType = f.payType;
+      if (f.minPay) query.minPay = f.minPay;
+      if (f.maxPay) query.maxPay = f.maxPay;
+      if (typeof f.verifiedCompany === "boolean") query.verifiedCompany = f.verifiedCompany;
+      if (typeof f.openToMinors === "boolean") query.openToMinors = f.openToMinors;
+      if (f.tags) query.tags = f.tags;
+    }
+    const url = `${API_BASE}/search/jobs?${qs(query)}`;
+    const res = await fetch(url, { credentials: "include" });
+    if (!res.ok) throw new Error(`Jobs.search failed: ${res.status}`);
+    return res.json();
+  }
+
+  static async save(jobId: string) {
+    const url = `${API_BASE}/jobs/${jobId}/save`;
+    const res = await fetch(url, { method: "POST", credentials: "include" });
+    if (!res.ok) throw new Error(`Jobs.save failed: ${res.status}`);
+    return res.json();
+  }
+
+  static async unsave(jobId: string) {
+    const url = `${API_BASE}/jobs/${jobId}/save`;
+    const res = await fetch(url, { method: "DELETE", credentials: "include" });
+    if (!res.ok) throw new Error(`Jobs.unsave failed: ${res.status}`);
+    return res.json();
+  }
+
+  static async savedList() {
+    const url = `${API_BASE}/users/me/saved-jobs`;
+    const res = await fetch(url, { credentials: "include" });
+    if (!res.ok) throw new Error(`Jobs.savedList failed: ${res.status}`);
+    return res.json();
+  }
+}
+
+=== path: apps/web/src/entities/all.ts (patch) ===
+export type LocationType = "REMOTE" | "ONSITE" | "HYBRID";
+export type PayType = "HOURLY" | "SALARY" | "STIPEND";
+export type ExperienceLevel = "ENTRY" | "JUNIOR" | "MID" | "SENIOR";
+
+export type Job = {
+  id: string;
+  title: string;
+  company: string; // (when coming from earlier mocks). In API we return job.company.name
+  companyObj?: { id: string; name: string; verified: boolean };
+  description: string;
+  location_type: LocationType;
+  locations: string[];
+  pay_min?: number;
+  pay_max?: number;
+  pay_type?: PayType;
+  currency?: string;
+  experience_level: ExperienceLevel;
+  min_age?: number;
+  open_to_minors: boolean;
+  required_skills: string[];
+  preferred_skills: string[];
+  benefits: string[];
+  requirements: string[];
+  external_url?: string;
+  verified_pay?: boolean;
+  tags: string[];
+  verified_company: boolean;
+  created_date?: string;
+};
+
+export type SavedJob = {
+  id: string;
+  job: any;
+  createdAt: string;
+};
+
+// Back-compat wrappers to the new SDK if you're still using legacy calls
+export const JobAPI = {
+  async search(params: any) {
+    const { Jobs } = await import("@/sdk/jobs");
+    return Jobs.search(params);
+  },
+  async saved() {
+    const { Jobs } = await import("@/sdk/jobs");
+    return Jobs.savedList();
+  },
+  async save(id: string) {
+    const { Jobs } = await import("@/sdk/jobs");
+    return Jobs.save(id);
+  },
+  async unsave(id: string) {
+    const { Jobs } = await import("@/sdk/jobs");
+    return Jobs.unsave(id);
+  }
+};
+
+=== path: apps/web/src/components/jobs/JobFilters.tsx ===
+import React from "react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Slider } from "@/components/ui/slider";
+import { FilterIcon } from "lucide-react";
+
+type Props = {
+  value: any;
+  onChange: (v: any) => void;
+  youthMode?: boolean;
+};
+
+export default function JobFilters({ value, onChange, youthMode }: Props) {
+  const set = (patch: any) => onChange({ ...value, ...patch });
+
+  return (
+    <Card className="bg-white/90 backdrop-blur-sm border border-gray-200/60 shadow-lg">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-lg">
+          <FilterIcon className="w-5 h-5 text-indigo-600" />
+          Filters
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <div>
+            <label className="text-sm font-medium text-gray-700 mb-2 block">Experience</label>
+            <Select value={(value.experienceLevel || ["all"])[0]} onValueChange={(val) => set({ experienceLevel: val === "all" ? undefined : [val] })}>
+              <SelectTrigger>
+                <SelectValue placeholder="Any" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">Any</SelectItem>
+                <SelectItem value="ENTRY">Entry</SelectItem>
+                <SelectItem value="JUNIOR">Junior</SelectItem>
+                <SelectItem value="MID">Mid</SelectItem>
+                <SelectItem value="SENIOR">Senior</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div>
+            <label className="text-sm font-medium text-gray-700 mb-2 block">Location</label>
+            <Select value={(value.locationType || ["all"])[0]} onValueChange={(val) => set({ locationType: val === "all" ? undefined : [val] })}>
+              <SelectTrigger>
+                <SelectValue placeholder="Any" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">Any</SelectItem>
+                <SelectItem value="REMOTE">Remote</SelectItem>
+                <SelectItem value="ONSITE">On-site</SelectItem>
+                <SelectItem value="HYBRID">Hybrid</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div>
+            <label className="text-sm font-medium text-gray-700 mb-2 block">Pay Type</label>
+            <Select value={(value.payType || ["all"])[0]} onValueChange={(val) => set({ payType: val === "all" ? undefined : [val] })}>
+              <SelectTrigger>
+                <SelectValue placeholder="Any" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">Any</SelectItem>
+                <SelectItem value="SALARY">Salary</SelectItem>
+                <SelectItem value="HOURLY">Hourly</SelectItem>
+                <SelectItem value="STIPEND">Stipend</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <label className="text-sm font-medium text-gray-700 block">Pay Range (min-max)</label>
+          <div className="grid grid-cols-2 gap-2">
+            <Input type="number" placeholder="Min $" value={value.minPay || ""} onChange={(e) => set({ minPay: Number(e.target.value || 0) || undefined })} />
+            <Input type="number" placeholder="Max $" value={value.maxPay || ""} onChange={(e) => set({ maxPay: Number(e.target.value || 0) || undefined })} />
+          </div>
+        </div>
+
+        <div className="grid gap-3">
+          <div className="flex items-center space-x-2">
+            <Checkbox
+              id="verifiedCompany"
+              checked={!!value.verifiedCompany}
+              onCheckedChange={(c) => set({ verifiedCompany: Boolean(c) })}
+            />
+            <label htmlFor="verifiedCompany" className="text-sm font-medium text-gray-700 cursor-pointer">
+              Verified employers only
+            </label>
+          </div>
+
+          {youthMode && (
+            <div className="flex items-center space-x-2">
+              <Checkbox
+                id="openToMinors"
+                checked={true}
+                onCheckedChange={() => {}}
+                disabled
+              />
+              <label htmlFor="openToMinors" className="text-sm font-medium text-gray-700 cursor-pointer">
+                Youth-friendly only (enforced)
+              </label>
+            </div>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+=== path: apps/web/src/pages/Jobs.tsx ===
+import React, { useEffect, useMemo, useState } from "react";
+import { Jobs as JobsSDK } from "@/sdk/jobs";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import JobFilters from "@/components/jobs/JobFilters";
+import { MapPinIcon, DollarSignIcon, ClockIcon, StarIcon, ShieldCheckIcon, ArrowRightIcon, SearchIcon, SparklesIcon } from "lucide-react";
+import { motion } from "framer-motion";
+
+type FilterState = {
+  experienceLevel?: string[];
+  locationType?: string[];
+  payType?: string[];
+  minPay?: number;
+  maxPay?: number;
+  verifiedCompany?: boolean;
+  openToMinors?: boolean;
+  tags?: string[];
+};
+
+function FitBadge({ score }: { score: number }) {
+  return (
+    <div className="flex flex-col items-center">
+      <div className="flex items-center gap-1 mb-1">
+        <StarIcon className="w-4 h-4 text-yellow-500 fill-current" />
+        <span className="text-sm font-semibold text-gray-700">{score}%</span>
+      </div>
+      <span className="text-xs text-gray-500">Match</span>
+    </div>
+  );
+}
+
+function JobCard({ job, onSave }: any) {
+  const company = job.company?.name || job.company?.company?.name || job.company?.title || job.company || "Company";
+
+  return (
+    <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} whileHover={{ y: -3 }}>
+      <Card className="bg-white/90 backdrop-blur-sm border border-gray-200/60 shadow-md hover:shadow-xl transition-all duration-300">
+        <CardHeader className="pb-3">
+          <div className="flex items-start justify-between">
+            <div className="flex-1">
+              <CardTitle className="text-lg font-bold text-gray-900">{job.title}</CardTitle>
+              <p className="text-sm text-gray-600 font-medium mt-1">{company}</p>
+              <div className="flex items-center gap-4 mt-3 text-sm text-gray-600">
+                <div className="flex items-center gap-1">
+                  <MapPinIcon className="w-4 h-4" />
+                  <span>{job.locationType === "REMOTE" ? "Remote" : (job.locations?.[0] || "Location")}</span>
+                </div>
+                {(job.payMin || job.payMax) && (
+                  <div className="flex items-center gap-1">
+                    <DollarSignIcon className="w-4 h-4" />
+                    <span>
+                      {job.payMin ? `$${job.payMin.toLocaleString()}` : ""}
+                      {job.payMax ? ` - $${job.payMax.toLocaleString()}` : job.payMin ? "+" : ""}
+                    </span>
+                  </div>
+                )}
+                {job.payType && (
+                  <div className="flex items-center gap-1">
+                    <ClockIcon className="w-4 h-4" />
+                    <span>{job.payType}</span>
+                  </div>
+                )}
+              </div>
+              <div className="flex flex-wrap gap-2 mt-3">
+                {job.openToMinors && <Badge className="bg-blue-100 text-blue-800 border-blue-200">Youth-Friendly</Badge>}
+                {job.verifiedCompany && <Badge className="bg-emerald-100 text-emerald-800 border-emerald-200">Verified</Badge>}
+                <Badge variant="outline" className="text-xs">{job.experienceLevel}</Badge>
+                {job.locationType === "REMOTE" && <Badge className="bg-purple-100 text-purple-800 border-purple-200">Remote OK</Badge>}
+              </div>
+            </div>
+            <FitBadge score={Math.floor(70 + Math.random() * 25)} />
+          </div>
+        </CardHeader>
+        <CardContent className="pt-0">
+          <div className="flex items-center justify-between pt-3 border-t border-gray-100">
+            <div className="text-xs text-gray-500">Posted {new Date(job.createdAt || Date.now()).toLocaleDateString()}</div>
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={() => onSave(job.id)}>Save</Button>
+              <a href={`/jobs/${job.id}`}>
+                <Button className="bg-gradient-to-r from-indigo-500 to-indigo-600 text-white">
+                  View
+                  <ArrowRightIcon className="w-4 h-4 ml-1" />
+                </Button>
+              </a>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+    </motion.div>
+  );
+}
+
+export default function JobsPage() {
+  const [q, setQ] = useState("");
+  const [filters, setFilters] = useState<FilterState>({});
+  const [youthMode, setYouthMode] = useState(false); // wire to auth user later
+  const [loading, setLoading] = useState(false);
+  const [page, setPage] = useState(1);
+  const [pageSize] = useState(20);
+  const [sort, setSort] = useState<"relevance" | "recent" | "pay_high" | "pay_low">("relevance");
+  const [total, setTotal] = useState(0);
+  const [jobs, setJobs] = useState<any[]>([]);
+
+  const fetchData = async (reset = true) => {
+    setLoading(true);
+    try {
+      const data = await JobsSDK.search({
+        q,
+        page: reset ? 1 : page,
+        pageSize,
+        sort,
+        filters: youthMode ? { ...filters, openToMinors: true } : filters,
+      });
+      setTotal(data.total);
+      setPage(data.page);
+      setJobs((prev) => (reset ? data.results : [...prev, ...data.results]));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { fetchData(true); /* eslint-disable-next-line */ }, [sort]);
+
+  const canLoadMore = useMemo(() => jobs.length < total, [jobs, total]);
+
+  const onSave = async (jobId: string) => {
+    try {
+      await JobsSDK.save(jobId);
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 via-white to-blue-50 p-6 md:p-8">
+      <div className="max-w-7xl mx-auto space-y-8">
+        <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+          <div>
+            <h1 className="text-3xl md:text-4xl font-bold text-gray-900">Find Your Next Opportunity</h1>
+            <p className="text-gray-600 mt-2">
+              Search verified roles tailored to your profile
+              {youthMode && (
+                <span className="inline-flex items-center gap-2 ml-2 px-3 py-1 bg-emerald-100 text-emerald-800 rounded-full text-sm font-medium">
+                  <SparklesIcon className="w-4 h-4" />
+                  Youth-Safe Mode
+                </span>
+              )}
+            </p>
+          </div>
+          <div className="flex items-center gap-3">
+            <select
+              className="border border-gray-200 rounded-lg py-2 px-3 bg-white"
+              value={sort}
+              onChange={(e) => setSort(e.target.value as any)}
+            >
+              <option value="relevance">Relevance</option>
+              <option value="recent">Most Recent</option>
+              <option value="pay_high">Highest Pay</option>
+              <option value="pay_low">Lowest Pay</option>
+            </select>
+            <Button onClick={() => fetchData(true)}>
+              Refresh
+            </Button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-8">
+          <div>
+            <JobFilters value={filters} onChange={setFilters} youthMode={youthMode} />
+          </div>
+          <div className="lg:col-span-3 space-y-6">
+            <div className="flex gap-2">
+              <div className="relative flex-1">
+                <SearchIcon className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-400 w-5 h-5" />
+                <Input
+                  placeholder="Search jobs, companies, or skills..."
+                  className="pl-12 h-12 bg-white/90 border-gray-200/60 shadow"
+                  value={q}
+                  onChange={(e) => setQ(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && fetchData(true)}
+                />
+              </div>
+              <Button onClick={() => fetchData(true)} className="h-12">
+                Search
+              </Button>
+            </div>
+
+            <div className="text-gray-600">
+              Showing {jobs.length} of {total} results
+            </div>
+
+            <div className="grid gap-6">
+              {jobs.map((job) => (
+                <JobCard key={job.id} job={job} onSave={onSave} />
+              ))}
+            </div>
+
+            <div className="flex justify-center">
+              {canLoadMore && (
+                <Button
+                  variant="outline"
+                  disabled={loading}
+                  onClick={() => {
+                    setPage((p) => p + 1);
+                    fetchData(false);
+                  }}
+                >
+                  {loading ? "Loading..." : "Load more"}
+                </Button>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+=== path: apps/web/src/pages/JobDetail.tsx ===
+import React, { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Jobs as JobsSDK } from "@/sdk/jobs";
+import { MapPinIcon, DollarSignIcon, ClockIcon, ShieldCheckIcon, SparklesIcon } from "lucide-react";
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8080";
+
+export default function JobDetail() {
+  const { id } = useParams();
+  const [job, setJob] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      try {
+        const res = await fetch(`${API_BASE}/jobs/${id}`);
+        if (!res.ok) throw new Error("Job load failed");
+        setJob(await res.json());
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [id]);
+
+  if (loading) return <div className="p-8">Loading...</div>;
+  if (!job) return <div className="p-8">Not found</div>;
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 via-white to-blue-50 p-6 md:p-8">
+      <div className="max-w-4xl mx-auto space-y-6">
+        <Card className="bg-white/90">
+          <CardHeader>
+            <CardTitle className="text-2xl font-bold">{job.title}</CardTitle>
+            <div className="text-gray-600 font-medium">{job.company?.name}</div>
+            <div className="flex items-center gap-4 mt-3 text-sm text-gray-600">
+              <div className="flex items-center gap-1">
+                <MapPinIcon className="w-4 h-4" />
+                <span>{job.locationType === "REMOTE" ? "Remote" : (job.locations?.[0] || "Location")}</span>
+              </div>
+              {(job.payMin || job.payMax) && (
+                <div className="flex items-center gap-1">
+                  <DollarSignIcon className="w-4 h-4" />
+                  <span>
+                    {job.payMin ? `$${job.payMin.toLocaleString()}` : ""}
+                    {job.payMax ? ` - $${job.payMax.toLocaleString()}` : job.payMin ? "+" : ""}
+                  </span>
+                </div>
+              )}
+              {job.payType && (
+                <div className="flex items-center gap-1">
+                  <ClockIcon className="w-4 h-4" />
+                  <span>{job.payType}</span>
+                </div>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-2 mt-3">
+              {job.openToMinors && <Badge className="bg-blue-100 text-blue-800 border-blue-200">Youth-Friendly</Badge>}
+              {job.verifiedCompany && <Badge className="bg-emerald-100 text-emerald-800 border-emerald-200">Verified</Badge>}
+              {job.verifiedPay && <Badge className="bg-emerald-50 text-emerald-700 border-emerald-200">Verified Pay</Badge>}
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            <div>
+              <h3 className="font-semibold text-gray-900 mb-2">About this role</h3>
+              <div className="prose prose-indigo max-w-none" dangerouslySetInnerHTML={{ __html: (job.description || "").replace(/\n/g, "<br/>") }} />
+            </div>
+
+            {job.requiredSkills?.length > 0 && (
+              <div>
+                <h3 className="font-semibold text-gray-900 mb-2">Required skills</h3>
+                <div className="flex flex-wrap gap-2">
+                  {job.requiredSkills.map((s: string) => (
+                    <Badge key={s} variant="secondary" className="bg-gray-100">{s}</Badge>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="flex gap-3">
+              <Button onClick={() => JobsSDK.save(job.id)} variant="outline">Save</Button>
+              {job.applicationUrl ? (
+                <a href={job.applicationUrl} target="_blank" rel="noreferrer">
+                  <Button className="bg-gradient-to-r from-indigo-500 to-indigo-600 text-white">Apply Externally</Button>
+                </a>
+              ) : (
+                <a href={`/applications/new?job=${job.id}`}>
+                  <Button className="bg-gradient-to-r from-indigo-500 to-indigo-600 text-white">
+                    Apply
+                  </Button>
+                </a>
+              )}
+            </div>
+
+            {job.openToMinors && (
+              <div className="mt-4 p-3 bg-emerald-50 border border-emerald-200 rounded">
+                <div className="flex items-center gap-2 text-emerald-800">
+                  <ShieldCheckIcon className="w-4 h-4" />
+                  Youth-safe role: direct contact is limited to verified recruiters.
+                </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+=== path: apps/api/src/routes/jobs.ts (patch) ===
+// Ensure this exists (from earlier bundles). If not, this minimal read route:
+import { Router } from "express";
+import { PrismaClient } from "@prisma/client";
+const prisma = new PrismaClient();
+export const jobsRouter = Router();
+
+jobsRouter.get("/jobs/:id", async (req, res) => {
+  try {
+    const job = await prisma.job.findUnique({
+      where: { id: String(req.params.id) },
+      include: { company: true },
+    });
+    if (!job) return res.status(404).json({ error: "NOT_FOUND" });
+    res.json(job);
+  } catch (e: any) {
+    res.status(500).json({ error: "JOB_ERROR", message: e?.message || "Unknown error" });
+  }
+});
+
+// In server.ts add: app.use("/", jobsRouter);
+
+=== path: apps/web/src/routes.ts (patch) ===
+// Example react-router setup
+import { createBrowserRouter } from "react-router-dom";
+import Layout from "@/layout/Layout";
+import JobsPage from "@/pages/Jobs";
+import JobDetail from "@/pages/JobDetail";
+
+export const router = createBrowserRouter([
+  {
+    path: "/",
+    element: <Layout currentPageName="Jobs"><JobsPage /></Layout>,
+  },
+  {
+    path: "/jobs",
+    element: <Layout currentPageName="Jobs"><JobsPage /></Layout>,
+  },
+  {
+    path: "/jobs/:id",
+    element: <Layout currentPageName="Jobs"><JobDetail /></Layout>,
+  },
+]);
+
+=== path: apps/web/src/sdk/jobs.ts (shim) ===
+export * from "packages/sdk/src/jobs";  // re-export in web app for nice aliasing
+
+=== path: README-BUNDLE-12.md ===
+# Bundle 12 — Candidate Job Discovery & Search v2
+
+**What you got**
+- API: `/search/jobs` query+filters+sort, youth-safe enforced for under-18 users
+- API: `/users/me/saved-jobs`, `/jobs/:id/save` (POST/DELETE)
+- SDK: `Jobs.search`, `Jobs.save`, `Jobs.unsave`, `Jobs.savedList`
+- Web: `Jobs` page with server-powered search + filters + infinite load
+- Web: `JobDetail` with save/apply and youth ribbons
+- Prisma: `SavedJob` model and Job indexes
+
+**How to wire**
+1. `prisma migrate dev --name add_saved_jobs_and_indexes`
+2. Ensure `apps/api/src/server.ts` uses `searchRouter`, `savedJobsRouter`, and `jobsRouter`.
+3. Start API & Web. Visit `/jobs` and `/jobs/:id`.
+4. Replace the `requireAuth` stubs with real auth (sets `req.user.id`, `req.user.ageMode`).
+
+**Next bundles to unlock**  
+- 13: AI Resume Tailoring & Cover Letters (server tools + UI)  
+- 14: Smart Job Alerts + Notifications (cron + webhooks)  
+- 15: Social Graph (profiles, posts, comments, follows, feed)  
+- 16: Realtime Messaging (threads, attachments, moderation)  
+- 17: Employer Analytics + Candidate Insights  
+- 18: Trust & Safety (report, block, content filters)  
+- 19: Payments & Premium (gates, usage limits)  
+- 20: Mobile (React Native shell)

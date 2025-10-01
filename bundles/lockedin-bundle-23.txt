@@ -1,0 +1,823 @@
+
+LockedIn — Bundle 23: Notifications & Activity System
+=====================================================
+
+This bundle adds a production-ready baseline for in‑app notifications, activity events,
+and user notification preferences. It plugs into your existing monorepo without secrets.
+
+──────────────────────────────────────────────────────────────────────────────
+FILE TREE
+──────────────────────────────────────────────────────────────────────────────
+services/notifications/
+  package.json
+  tsconfig.json
+  src/
+    index.ts
+    routes.ts
+    repo.ts
+    prefs.ts
+    sockets.ts
+    schema.ts
+    utils.ts
+packages/contracts/src/notifications.ts
+apps/web/src/hooks/useNotifications.ts
+apps/web/src/components/notifications/NotificationBell.tsx
+apps/web/src/components/notifications/NotificationList.tsx
+apps/web/src/pages/NotificationsPage.tsx
+db/migrations/023_notifications.sql
+docs/INTEGRATION-notifications.md
+.env.example (append-only snippet)
+
+──────────────────────────────────────────────────────────────────────────────
+services/notifications/package.json
+──────────────────────────────────────────────────────────────────────────────
+{
+  "name": "@lockedin/notifications",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node --enable-source-maps --env-file=.env dist/index.js",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "helmet": "^7.0.0",
+    "pino": "^9.0.0",
+    "pino-http": "^10.3.0",
+    "socket.io": "^4.7.5",
+    "zod": "^3.23.8",
+    "better-sqlite3": "^9.4.0",
+    "ulid": "^2.3.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.15.7",
+    "typescript": "^5.6.3"
+  }
+}
+
+──────────────────────────────────────────────────────────────────────────────
+services/notifications/tsconfig.json
+──────────────────────────────────────────────────────────────────────────────
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
+
+──────────────────────────────────────────────────────────────────────────────
+services/notifications/src/schema.ts
+──────────────────────────────────────────────────────────────────────────────
+import { z } from "zod";
+
+export const NotificationType = z.enum([
+  "MESSAGE_RECEIVED",
+  "CONNECTION_REQUEST",
+  "CONNECTION_ACCEPTED",
+  "JOB_MATCH",
+  "APPLICATION_STATUS",
+  "INTERVIEW_SCHEDULED",
+  "POST_LIKED",
+  "POST_COMMENTED",
+  "MENTION",
+  "SYSTEM_ANNOUNCEMENT",
+  "YOUTH_SAFETY_ALERT"
+]);
+
+export type NotificationType = z.infer<typeof NotificationType>;
+
+export const Notification = z.object({
+  id: z.string(),                // ulid
+  user_id: z.string(),
+  type: NotificationType,
+  title: z.string(),
+  body: z.string(),
+  data: z.record(z.any()).default({}),
+  priority: z.enum(["low","normal","high"]).default("normal"),
+  read_at: z.string().nullable().optional(),
+  created_at: z.string(),
+});
+
+export type Notification = z.infer<typeof Notification>;
+
+export const Preference = z.object({
+  user_id: z.string(),
+  in_app: z.boolean().default(true),
+  email: z.boolean().default(false),
+  push: z.boolean().default(false),
+  digest: z.enum(["off","daily","weekly"]).default("off"),
+  quiet_hours_start: z.number().min(0).max(23).nullable().default(null),
+  quiet_hours_end: z.number().min(0).max(23).nullable().default(null),
+  youth_safe: z.boolean().default(false)
+});
+
+export type Preference = z.infer<typeof Preference>;
+
+export const IngestEvent = z.object({
+  user_id: z.string(),
+  type: NotificationType,
+  title: z.string(),
+  body: z.string(),
+  data: z.record(z.any()).optional(),
+  priority: z.enum(["low","normal","high"]).optional()
+});
+
+export type IngestEvent = z.infer<typeof IngestEvent>;
+
+──────────────────────────────────────────────────────────────────────────────
+services/notifications/src/repo.ts
+──────────────────────────────────────────────────────────────────────────────
+import Database from "better-sqlite3";
+import { ulid } from "ulid";
+import { Notification, Preference, IngestEvent } from "./schema.js";
+
+const dbPath = process.env.NOTIFICATIONS_SQLITE_PATH || "data/notifications.db";
+const db = new Database(dbPath);
+db.pragma("journal_mode = WAL");
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS notifications (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  data TEXT,
+  priority TEXT DEFAULT 'normal',
+  read_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications (user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS notification_prefs (
+  user_id TEXT PRIMARY KEY,
+  in_app INTEGER DEFAULT 1,
+  email INTEGER DEFAULT 0,
+  push INTEGER DEFAULT 0,
+  digest TEXT DEFAULT 'off',
+  quiet_hours_start INTEGER,
+  quiet_hours_end INTEGER,
+  youth_safe INTEGER DEFAULT 0
+);
+`);
+
+export const repo = {
+  listByUser(user_id: string, limit = 50, cursor?: string) {
+    const stmt = db.prepare(`
+      SELECT * FROM notifications
+      WHERE user_id = ? AND (? IS NULL OR created_at < ?)
+      ORDER BY created_at DESC
+      LIMIT ?
+    `);
+    const rows = stmt.all(user_id, cursor || null, cursor || null, limit);
+    return rows.map(r => ({ ...r, data: r.data ? JSON.parse(r.data) : {} }));
+  },
+  markRead(user_id: string, ids: string[]) {
+    const tx = db.transaction((ids: string[]) => {
+      const stmt = db.prepare(`UPDATE notifications SET read_at = datetime('now') WHERE user_id = ? AND id = ?`);
+      ids.forEach(id => stmt.run(user_id, id));
+    });
+    tx(ids);
+  },
+  markAllRead(user_id: string) {
+    db.prepare(`UPDATE notifications SET read_at = datetime('now') WHERE user_id = ? AND read_at IS NULL`).run(user_id);
+  },
+  upsertPrefs(p: Preference) {
+    db.prepare(`
+      INSERT INTO notification_prefs (user_id, in_app, email, push, digest, quiet_hours_start, quiet_hours_end, youth_safe)
+      VALUES (@user_id, @in_app, @email, @push, @digest, @quiet_hours_start, @quiet_hours_end, @youth_safe)
+      ON CONFLICT(user_id) DO UPDATE SET
+        in_app=excluded.in_app,
+        email=excluded.email,
+        push=excluded.push,
+        digest=excluded.digest,
+        quiet_hours_start=excluded.quiet_hours_start,
+        quiet_hours_end=excluded.quiet_hours_end,
+        youth_safe=excluded.youth_safe
+    `).run({
+      ...p,
+      in_app: p.in_app ? 1 : 0,
+      email: p.email ? 1 : 0,
+      push: p.push ? 1 : 0,
+      youth_safe: p.youth_safe ? 1 : 0
+    });
+  },
+  getPrefs(user_id: string): Preference {
+    const row = db.prepare(`SELECT * FROM notification_prefs WHERE user_id = ?`).get(user_id);
+    if (!row) return {
+      user_id, in_app: true, email: false, push: false, digest: "off",
+      quiet_hours_start: null, quiet_hours_end: null, youth_safe: false
+    };
+    return {
+      user_id,
+      in_app: !!row.in_app,
+      email: !!row.email,
+      push: !!row.push,
+      digest: row.digest,
+      quiet_hours_start: row.quiet_hours_start ?? null,
+      quiet_hours_end: row.quiet_hours_end ?? null,
+      youth_safe: !!row.youth_safe
+    };
+  },
+  ingest(ev: IngestEvent) {
+    const id = ulid();
+    const created_at = new Date().toISOString();
+    const row = { id, created_at, ...ev, data: JSON.stringify(ev.data || {}) };
+    db.prepare(`
+      INSERT INTO notifications (id, user_id, type, title, body, data, priority, created_at)
+      VALUES (@id, @user_id, @type, @title, @body, @data, @priority, @created_at)
+    `).run({ ...row, priority: ev.priority || "normal" });
+    return { ...row, data: ev.data || {} };
+  }
+};
+
+export type Repo = typeof repo;
+
+──────────────────────────────────────────────────────────────────────────────
+services/notifications/src/prefs.ts
+──────────────────────────────────────────────────────────────────────────────
+import { Preference } from "./schema.js";
+import type { Repo } from "./repo.js";
+
+export function enforceYouthSafety(prefs: Preference, payload: { title: string; body: string; type: string }) {
+  if (!prefs.youth_safe) return payload;
+  // Minimal redaction logic for minors
+  if (payload.type === "MESSAGE_RECEIVED") {
+    return { ...payload, body: "You received a new message." };
+  }
+  if (payload.type === "SYSTEM_ANNOUNCEMENT") {
+    return payload; // system messages are allowed
+  }
+  return payload;
+}
+
+export function isQuietHours(prefs: Preference, now = new Date()) {
+  if (prefs.quiet_hours_start == null || prefs.quiet_hours_end == null) return false;
+  const h = now.getHours();
+  const { quiet_hours_start: s, quiet_hours_end: e } = prefs;
+  return s <= e ? (h >= s && h < e) : (h >= s || h < e); // wraps midnight
+}
+
+export function channelsFor(prefs: Preference) {
+  return {
+    in_app: prefs.in_app,
+    email: prefs.email,
+    push: prefs.push
+  };
+}
+
+export function ensureDefaults(user_id: string, repo: Repo) {
+  const p = repo.getPrefs(user_id);
+  if (!p) {
+    repo.upsertPrefs({
+      user_id,
+      in_app: true, email: false, push: false,
+      digest: "off", quiet_hours_start: null, quiet_hours_end: null, youth_safe: false
+    });
+  }
+}
+
+──────────────────────────────────────────────────────────────────────────────
+services/notifications/src/sockets.ts
+──────────────────────────────────────────────────────────────────────────────
+import type { Server } from "socket.io";
+
+type UserSocketIndex = Map<string, Set<string>>; // user_id -> socket ids
+const userSockets: UserSocketIndex = new Map();
+
+export function wireSocket(io: Server) {
+  io.on("connection", (socket) => {
+    const userId = socket.handshake.auth?.user_id || socket.handshake.query?.user_id;
+    if (typeof userId === "string" && userId.length) {
+      let set = userSockets.get(userId);
+      if (!set) { set = new Set(); userSockets.set(userId, set); }
+      set.add(socket.id);
+      socket.join(`user:${userId}`);
+    }
+
+    socket.on("disconnect", () => {
+      for (const [u, set] of userSockets.entries()) {
+        if (set.has(socket.id)) {
+          set.delete(socket.id);
+          if (set.size === 0) userSockets.delete(u);
+          break;
+        }
+      }
+    });
+  });
+}
+
+export function emitToUser(io: Server, user_id: string, event: string, payload: any) {
+  io.to(`user:${user_id}`).emit(event, payload);
+}
+
+──────────────────────────────────────────────────────────────────────────────
+services/notifications/src/utils.ts
+──────────────────────────────────────────────────────────────────────────────
+import pino from "pino";
+export const logger = pino({ level: process.env.LOG_LEVEL || "info" });
+
+export function requireUser(req: any, _res: any, next: any) {
+  // Dev shim: trust x-user-id for local testing. Replace with centralized auth in prod.
+  const user = req.header("x-user-id") || req.query.user_id;
+  if (!user) return next();
+  (req as any).user_id = String(user);
+  next();
+}
+
+──────────────────────────────────────────────────────────────────────────────
+services/notifications/src/routes.ts
+──────────────────────────────────────────────────────────────────────────────
+import { Router } from "express";
+import { repo } from "./repo.js";
+import { IngestEvent, Preference } from "./schema.js";
+import { enforceYouthSafety, isQuietHours, channelsFor } from "./prefs.js";
+import type { Server } from "socket.io";
+import { emitToUser } from "./sockets.js";
+
+export function buildRouter(io: Server) {
+  const r = Router();
+
+  // List notifications for the authed user
+  r.get("/", (req, res) => {
+    const user_id = (req as any).user_id || req.query.user_id;
+    if (!user_id) return res.status(401).json({ error: "missing user" });
+    const limit = Math.min(Number(req.query.limit || 50), 100);
+    const cursor = (req.query.cursor as string | undefined) || undefined;
+    const items = repo.listByUser(String(user_id), limit, cursor);
+    res.json({ items, next_cursor: items.at(-1)?.created_at || null });
+  });
+
+  // Mark read
+  r.post("/mark-read", (req, res) => {
+    const user_id = (req as any).user_id || req.query.user_id;
+    if (!user_id) return res.status(401).json({ error: "missing user" });
+    const ids: string[] = req.body?.ids || [];
+    repo.markRead(String(user_id), ids);
+    res.json({ ok: true, ids });
+  });
+
+  r.post("/mark-all-read", (req, res) => {
+    const user_id = (req as any).user_id || req.query.user_id;
+    if (!user_id) return res.status(401).json({ error: "missing user" });
+    repo.markAllRead(String(user_id));
+    res.json({ ok: true });
+  });
+
+  // Preferences
+  r.get("/prefs", (req, res) => {
+    const user_id = (req as any).user_id || req.query.user_id;
+    if (!user_id) return res.status(401).json({ error: "missing user" });
+    res.json(repo.getPrefs(String(user_id)));
+  });
+
+  r.put("/prefs", (req, res) => {
+    const user_id = (req as any).user_id || req.query.user_id;
+    if (!user_id) return res.status(401).json({ error: "missing user" });
+    const raw = { ...req.body, user_id: String(user_id) };
+    const parsed = Preference.safeParse(raw);
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+    repo.upsertPrefs(parsed.data);
+    res.json(parsed.data);
+  });
+
+  // Ingest an event from other services
+  r.post("/ingest", (req, res) => {
+    const parsed = IngestEvent.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+    const prefs = repo.getPrefs(parsed.data.user_id);
+    const safePayload = enforceYouthSafety(prefs, {
+      title: parsed.data.title,
+      body: parsed.data.body,
+      type: parsed.data.type
+    });
+
+    // store
+    const created = repo.ingest({ ...parsed.data, ...safePayload });
+
+    // deliver (in-app always if enabled & not quiet hours)
+    const ch = channelsFor(prefs);
+    if (ch.in_app && !isQuietHours(prefs)) {
+      emitToUser(io, parsed.data.user_id, "notify:created", created);
+    }
+    // email/push channels intentionally omitted (no secrets/keys)
+
+    res.json(created);
+  });
+
+  // Dev-only test route
+  r.post("/test", (req, res) => {
+    const user_id = (req as any).user_id || req.query.user_id;
+    if (!user_id) return res.status(401).json({ error: "missing user" });
+    const created = repo.ingest({
+      user_id: String(user_id),
+      type: "SYSTEM_ANNOUNCEMENT",
+      title: "Test notification",
+      body: "Hello from /notifications/test"
+    } as any);
+    emitToUser(io, String(user_id), "notify:created", created);
+    res.json(created);
+  });
+
+  return r;
+}
+
+──────────────────────────────────────────────────────────────────────────────
+services/notifications/src/index.ts
+──────────────────────────────────────────────────────────────────────────────
+import express from "express";
+import helmet from "helmet";
+import cors from "cors";
+import { createServer } from "http";
+import { Server } from "socket.io";
+import dotenv from "dotenv";
+import pinoHttp from "pino-http";
+import { buildRouter } from "./routes.js";
+import { wireSocket } from "./sockets.js";
+import { requireUser } from "./utils.js";
+
+dotenv.config();
+
+const app = express();
+app.use(helmet());
+app.use(cors({ origin: true, credentials: true }));
+app.use(express.json());
+app.use(pinoHttp());
+app.use(requireUser);
+
+const httpServer = createServer(app);
+const io = new Server(httpServer, { cors: { origin: true } });
+wireSocket(io);
+
+// Health
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+// API
+app.use("/notifications", buildRouter(io));
+
+const port = Number(process.env.NOTIFICATIONS_PORT || 4302);
+httpServer.listen(port, () => {
+  console.log(`[notifications] listening on :${port}`);
+});
+
+──────────────────────────────────────────────────────────────────────────────
+packages/contracts/src/notifications.ts
+──────────────────────────────────────────────────────────────────────────────
+export type NotificationType =
+  | "MESSAGE_RECEIVED"
+  | "CONNECTION_REQUEST"
+  | "CONNECTION_ACCEPTED"
+  | "JOB_MATCH"
+  | "APPLICATION_STATUS"
+  | "INTERVIEW_SCHEDULED"
+  | "POST_LIKED"
+  | "POST_COMMENTED"
+  | "MENTION"
+  | "SYSTEM_ANNOUNCEMENT"
+  | "YOUTH_SAFETY_ALERT";
+
+export type Notification = {
+  id: string;
+  user_id: string;
+  type: NotificationType;
+  title: string;
+  body: string;
+  data?: Record<string, any>;
+  priority?: "low" | "normal" | "high";
+  read_at?: string | null;
+  created_at: string;
+};
+
+export type NotificationPrefs = {
+  user_id: string;
+  in_app: boolean;
+  email: boolean;
+  push: boolean;
+  digest: "off" | "daily" | "weekly";
+  quiet_hours_start: number | null;
+  quiet_hours_end: number | null;
+  youth_safe: boolean;
+};
+
+──────────────────────────────────────────────────────────────────────────────
+apps/web/src/hooks/useNotifications.ts
+──────────────────────────────────────────────────────────────────────────────
+import { useEffect, useRef, useState } from "react";
+import { io, Socket } from "socket.io-client";
+import type { Notification, NotificationPrefs } from "@contracts/notifications";
+
+type Options = {
+  baseUrl?: string;
+  userId?: string;
+  token?: string; // if you wire centralized auth later
+};
+
+export function useNotifications(opts: Options = {}) {
+  const baseUrl = opts.baseUrl || (import.meta as any).env?.VITE_NOTIFICATIONS_URL || "http://localhost:4302";
+  const userId = opts.userId;
+  const [items, setItems] = useState<Notification[]>([]);
+  const [unread, setUnread] = useState(0);
+  const [prefs, setPrefs] = useState<NotificationPrefs | null>(null);
+  const socketRef = useRef<Socket | null>(null);
+  const cursorRef = useRef<string | null>(null);
+  const loadingRef = useRef(false);
+
+  useEffect(() => {
+    if (!userId) return;
+    // initial fetch
+    fetch(`${baseUrl}/notifications?limit=25`, { headers: { "x-user-id": userId }})
+      .then(r => r.json())
+      .then(d => {
+        setItems(d.items || []);
+        cursorRef.current = d.next_cursor || null;
+        setUnread(d.items?.filter((n: any) => !n.read_at).length || 0);
+      })
+      .catch(() => {});
+
+    // prefs
+    fetch(`${baseUrl}/notifications/prefs`, { headers: { "x-user-id": userId }})
+      .then(r => r.json())
+      .then(setPrefs)
+      .catch(() => {});
+
+    // realtime
+    const socket = io(baseUrl, { auth: { user_id: userId } });
+    socket.on("notify:created", (n: Notification) => {
+      setItems(prev => [n, ...prev]);
+      setUnread(prev => prev + 1);
+    });
+    socketRef.current = socket;
+    return () => { socket.disconnect(); socketRef.current = null; };
+  }, [userId]);
+
+  const loadMore = async () => {
+    if (loadingRef.current || !cursorRef.current) return;
+    loadingRef.current = true;
+    try {
+      const r = await fetch(`${baseUrl}/notifications?limit=25&cursor=${encodeURIComponent(cursorRef.current)}`, { headers: { "x-user-id": userId! }});
+      const d = await r.json();
+      setItems(prev => [...prev, ...(d.items || [])]);
+      cursorRef.current = d.next_cursor || null;
+    } finally {
+      loadingRef.current = false;
+    }
+  };
+
+  const markAllRead = async () => {
+    await fetch(`${baseUrl}/notifications/mark-all-read`, { method: "POST", headers: { "Content-Type": "application/json", "x-user-id": userId! } });
+    setItems(prev => prev.map(n => ({ ...n, read_at: n.read_at || new Date().toISOString() })));
+    setUnread(0);
+  };
+
+  const updatePrefs = async (next: Partial<NotificationPrefs>) => {
+    const r = await fetch(`${baseUrl}/notifications/prefs`, { method: "PUT", headers: { "Content-Type": "application/json", "x-user-id": userId! }, body: JSON.stringify({ ...(prefs||{}), ...next }) });
+    const d = await r.json();
+    setPrefs(d);
+  };
+
+  return { items, unread, prefs, loadMore, markAllRead, updatePrefs };
+}
+
+──────────────────────────────────────────────────────────────────────────────
+apps/web/src/components/notifications/NotificationBell.tsx
+──────────────────────────────────────────────────────────────────────────────
+import React from "react";
+import { useNotifications } from "@/hooks/useNotifications";
+import { BellIcon } from "lucide-react";
+import { Link } from "react-router-dom";
+import { createPageUrl } from "@/utils";
+
+export function NotificationBell({ userId }: { userId: string }) {
+  const { unread } = useNotifications({ userId });
+
+  return (
+    <Link to={createPageUrl("Notifications")} className="relative inline-flex items-center justify-center p-2 rounded-xl hover:bg-indigo-50 transition-colors">
+      <BellIcon className="w-5 h-5 text-gray-600" />
+      {unread > 0 && (
+        <span className="absolute -top-0.5 -right-0.5 min-w-[18px] h-[18px] px-1 bg-gradient-to-r from-indigo-500 to-purple-500 text-white text-[11px] leading-[18px] font-bold rounded-full flex items-center justify-center shadow">
+          {unread > 99 ? "99+" : unread}
+        </span>
+      )}
+    </Link>
+  );
+}
+
+export default NotificationBell;
+
+──────────────────────────────────────────────────────────────────────────────
+apps/web/src/components/notifications/NotificationList.tsx
+──────────────────────────────────────────────────────────────────────────────
+import React from "react";
+import type { Notification } from "@contracts/notifications";
+import { Badge } from "@/components/ui/badge";
+
+function Item({ n }: { n: Notification }) {
+  const subtle = n.read_at ? "opacity-70" : "";
+  const when = new Date(n.created_at).toLocaleString();
+  const hues: Record<string,string> = {
+    MESSAGE_RECEIVED: "bg-blue-100 text-blue-800",
+    CONNECTION_REQUEST: "bg-violet-100 text-violet-800",
+    CONNECTION_ACCEPTED: "bg-emerald-100 text-emerald-800",
+    JOB_MATCH: "bg-indigo-100 text-indigo-800",
+    APPLICATION_STATUS: "bg-amber-100 text-amber-800",
+    INTERVIEW_SCHEDULED: "bg-fuchsia-100 text-fuchsia-800",
+    POST_LIKED: "bg-pink-100 text-pink-800",
+    POST_COMMENTED: "bg-rose-100 text-rose-800",
+    MENTION: "bg-cyan-100 text-cyan-800",
+    SYSTEM_ANNOUNCEMENT: "bg-slate-100 text-slate-800",
+    YOUTH_SAFETY_ALERT: "bg-green-100 text-green-800"
+  };
+
+  return (
+    <div className={`p-4 rounded-xl border border-gray-200/60 bg-white/80 shadow-sm hover:shadow-md transition ${subtle}`}>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-2 mb-1">
+            <Badge className={`${hues[n.type] || "bg-gray-100 text-gray-800"}`}>{n.type.replaceAll("_", " ")}</Badge>
+            <span className="text-xs text-gray-500">{when}</span>
+          </div>
+          <div className="text-gray-900 font-semibold">{n.title}</div>
+          <div className="text-gray-600 text-sm mt-1">{n.body}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function NotificationList({ items }: { items: Notification[] }) {
+  return (
+    <div className="space-y-3">
+      {items.map(n => <Item key={n.id} n={n} />)}
+    </div>
+  );
+}
+
+export default NotificationList;
+
+──────────────────────────────────────────────────────────────────────────────
+apps/web/src/pages/NotificationsPage.tsx
+──────────────────────────────────────────────────────────────────────────────
+import React from "react";
+import { useNotifications } from "@/hooks/useNotifications";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import NotificationList from "@/components/notifications/NotificationList";
+import { SparklesIcon, BellIcon } from "lucide-react";
+
+export default function NotificationsPage() {
+  // Replace with real user id from your auth state/context
+  const userId = "dev-user-1";
+  const { items, prefs, markAllRead, updatePrefs, loadMore } = useNotifications({ userId });
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 via-white to-blue-50 p-6 md:p-8">
+      <div className="max-w-4xl mx-auto space-y-8">
+        <div className="flex items-center justify-between">
+          <h1 className="text-3xl md:text-4xl font-bold text-gray-900">Notifications</h1>
+          <Button onClick={markAllRead} variant="outline">
+            <BellIcon className="w-4 h-4 mr-2" /> Mark all read
+          </Button>
+        </div>
+
+        <Card className="bg-white/90 backdrop-blur-sm border border-gray-200/60 shadow-lg">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <SparklesIcon className="w-5 h-5 text-indigo-600" />
+              Preferences
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3 text-sm">
+            <div className="flex items-center justify-between">
+              <span>In‑app</span>
+              <Button size="sm" variant="outline" onClick={() => updatePrefs({ in_app: !prefs?.in_app })}>
+                {prefs?.in_app ? "On" : "Off"}
+              </Button>
+            </div>
+            <div className="flex items-center justify-between">
+              <span>Email</span>
+              <Button size="sm" variant="outline" onClick={() => updatePrefs({ email: !prefs?.email })}>
+                {prefs?.email ? "On" : "Off"}
+              </Button>
+            </div>
+            <div className="flex items-center justify-between">
+              <span>Push</span>
+              <Button size="sm" variant="outline" onClick={() => updatePrefs({ push: !prefs?.push })}>
+                {prefs?.push ? "On" : "Off"}
+              </Button>
+            </div>
+            <div className="flex items-center justify-between">
+              <span>Youth‑Safe</span>
+              <Button size="sm" variant="outline" onClick={() => updatePrefs({ youth_safe: !prefs?.youth_safe })}>
+                {prefs?.youth_safe ? "On" : "Off"}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        <NotificationList items={items} />
+
+        <div className="flex justify-center">
+          <Button variant="ghost" onClick={loadMore}>Load more</Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+──────────────────────────────────────────────────────────────────────────────
+db/migrations/023_notifications.sql
+──────────────────────────────────────────────────────────────────────────────
+-- Postgres migration (optional if you prefer PG over SQLite for prod)
+CREATE TABLE IF NOT EXISTS notifications (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  data JSONB,
+  priority TEXT DEFAULT 'normal',
+  read_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications (user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS notification_prefs (
+  user_id TEXT PRIMARY KEY,
+  in_app BOOLEAN DEFAULT TRUE,
+  email BOOLEAN DEFAULT FALSE,
+  push BOOLEAN DEFAULT FALSE,
+  digest TEXT DEFAULT 'off',
+  quiet_hours_start INT,
+  quiet_hours_end INT,
+  youth_safe BOOLEAN DEFAULT FALSE
+);
+
+──────────────────────────────────────────────────────────────────────────────
+docs/INTEGRATION-notifications.md
+──────────────────────────────────────────────────────────────────────────────
+# Notifications Integration
+
+## Service URL
+- Base: `http://localhost:4302`
+- Health: `GET /health`
+- List: `GET /notifications?limit=50&cursor=<iso>` (header: `x-user-id`)
+- Mark read: `POST /notifications/mark-read` body `{ ids: string[] }`
+- Mark all read: `POST /notifications/mark-all-read`
+- Preferences:
+  - `GET /notifications/prefs`
+  - `PUT /notifications/prefs` body `NotificationPrefs`
+- Ingest: `POST /notifications/ingest` with body:
+  ```json
+  { "user_id": "u1", "type": "JOB_MATCH", "title": "New match", "body": "We found a job match", "data": { "job_id": "j1" } }
+  ```
+
+Headers for local dev: `x-user-id: <your-dev-user>`
+
+## Socket.IO
+- Namespace: root
+- Join behavior: server joins sockets to `user:<user_id>` based on `auth.user_id` in the connection
+- Event: `notify:created` → payload is `Notification`
+
+## Youth-Safe Behavior
+- If user prefs `youth_safe = true`:
+  - Redacts message body for `MESSAGE_RECEIVED` to a generic line
+  - (Extend this file with more rules as needed)
+
+## Adding Triggers From Other Services
+Call `/notifications/ingest` when notable events occur:
+- DM message created → `MESSAGE_RECEIVED`
+- Connection request/accept → `CONNECTION_*`
+- New job match → `JOB_MATCH` (include `job_id`, `score`)
+- Application status change → `APPLICATION_STATUS` (`status`, `application_id`)
+- Interview scheduled → `INTERVIEW_SCHEDULED` (`application_id`, `date`)
+- Post like/comment/mention → `POST_*`, `MENTION`
+
+Keep the event small; link rich data by id in `data`.
+
+──────────────────────────────────────────────────────────────────────────────
+.env.example (append‑only)
+──────────────────────────────────────────────────────────────────────────────
+# Notifications service (no secrets required; safe defaults)
+NOTIFICATIONS_PORT=4302
+NOTIFICATIONS_SQLITE_PATH=./data/notifications.db
+
+──────────────────────────────────────────────────────────────────────────────
+NOTES
+──────────────────────────────────────────────────────────────────────────────
+- No API keys or personal info. Email/Push are stubbed out intentionally.
+- SQLite is used for dev; a Postgres migration is included for prod.
+- Socket.IO is used for in‑app realtime delivery and integrates with your existing web client.
+- Youth‑safe mode is respected at delivery time; expand redactions as policies evolve.
+- Replace the dev user id in `NotificationsPage` with your auth state.
+

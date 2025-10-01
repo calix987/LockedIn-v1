@@ -1,0 +1,640 @@
+=== path: packages/api/prisma/partials/notifications.prisma ===
+/// Merge this into your main Prisma schema (do not duplicate datasource/generator).
+/// Then run: pnpm -w prisma:migrate "notifications"
+
+enum NotificationType {
+  JOB_MATCH
+  APPLICATION_STATUS
+  MESSAGE
+  SYSTEM
+  COACH_TIP
+  PROFILE_REMINDER
+  SAFETY_ALERT
+}
+
+enum NotificationStatus {
+  UNREAD
+  READ
+  ARCHIVED
+}
+
+model Notification {
+  id           String              @id @default(cuid())
+  userId       String
+  user         User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type         NotificationType
+  status       NotificationStatus  @default(UNREAD)
+  title        String
+  body         String
+  actionUrl    String?
+  data         Json?
+  source       String?             // e.g., "job-matcher", "applications", "messaging"
+  priority     Int                 @default(0) // 0=normal, higher = more important
+  createdAt    DateTime            @default(now())
+  readAt       DateTime?
+  archivedAt   DateTime?
+
+  @@index([userId, status, createdAt])
+  @@index([userId, createdAt])
+}
+
+=== path: packages/contracts/src/notifications.ts ===
+export type NotificationType =
+  | "JOB_MATCH"
+  | "APPLICATION_STATUS"
+  | "MESSAGE"
+  | "SYSTEM"
+  | "COACH_TIP"
+  | "PROFILE_REMINDER"
+  | "SAFETY_ALERT";
+
+export type NotificationStatus = "UNREAD" | "READ" | "ARCHIVED";
+
+export interface NotificationDTO {
+  id: string;
+  userId: string;
+  type: NotificationType;
+  status: NotificationStatus;
+  title: string;
+  body: string;
+  actionUrl?: string | null;
+  data?: Record<string, any> | null;
+  source?: string | null;
+  priority: number;
+  createdAt: string; // ISO
+  readAt?: string | null;
+  archivedAt?: string | null;
+}
+
+export interface ListNotificationsQuery {
+  status?: NotificationStatus | "ALL";
+  cursor?: string;
+  limit?: number; // default 20
+}
+
+export interface CreateNotificationInput {
+  userId: string;
+  type: NotificationType;
+  title: string;
+  body: string;
+  actionUrl?: string;
+  data?: Record<string, any>;
+  source?: string;
+  priority?: number;
+}
+
+=== path: packages/api/src/modules/notifications/notifications.service.ts ===
+import { PrismaClient } from "@prisma/client";
+import type { CreateNotificationInput } from "@lockedin/contracts/notifications";
+
+const prisma = new PrismaClient();
+
+export const NotificationsService = {
+  async create(input: CreateNotificationInput) {
+    const n = await prisma.notification.create({
+      data: {
+        userId: input.userId,
+        type: input.type as any,
+        title: input.title,
+        body: input.body,
+        actionUrl: input.actionUrl,
+        data: input.data as any,
+        source: input.source,
+        priority: input.priority ?? 0,
+      },
+    });
+    // Emit SSE event
+    try {
+      const { publishToUser } = await import("./notifications.sse");
+      publishToUser(n.userId, { kind: "notification:new", payload: n });
+    } catch {}
+    return n;
+  },
+
+  async list(userId: string, opts: { status?: string; cursor?: string; limit?: number } = {}) {
+    const { status = "ALL", cursor, limit = 20 } = opts;
+    const where =
+      status === "ALL"
+        ? { userId }
+        : { userId, status: status as any };
+
+    const items = await prisma.notification.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      take: limit + 1,
+      ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
+    });
+
+    let nextCursor: string | undefined;
+    if (items.length > limit) {
+      const next = items.pop();
+      nextCursor = next?.id;
+    }
+    return { items, nextCursor };
+  },
+
+  async markRead(userId: string, id: string) {
+    const n = await prisma.notification.updateMany({
+      where: { id, userId },
+      data: { status: "READ", readAt: new Date() },
+    });
+    return n.count > 0;
+  },
+
+  async markAllRead(userId: string) {
+    const r = await prisma.notification.updateMany({
+      where: { userId, status: "UNREAD" },
+      data: { status: "READ", readAt: new Date() },
+    });
+    return r.count;
+  },
+
+  async archive(userId: string, id: string) {
+    const n = await prisma.notification.updateMany({
+      where: { id, userId },
+      data: { status: "ARCHIVED", archivedAt: new Date() },
+    });
+    return n.count > 0;
+  },
+};
+
+=== path: packages/api/src/modules/notifications/notifications.sse.ts ===
+import type { Request, Response } from "express";
+import { EventEmitter } from "events";
+
+type ServerEvent =
+  | { kind: "notification:new"; payload: any }
+  | { kind: "notification:read"; payload: { id: string } };
+
+const emitter = new EventEmitter();
+// userId -> Set of responses
+const clients = new Map<string, Set<Response>>();
+
+function getUserId(req: Request): string | null {
+  // Replace with your auth middleware. This fallback reads from header for local dev.
+  const headerId = (req.headers["x-user-id"] as string) || null;
+  // @ts-ignore
+  const authed = req.user?.id || null;
+  return (authed as string) || headerId;
+}
+
+export function sseHandler(req: Request, res: Response) {
+  const userId = getUserId(req);
+  if (!userId) {
+    res.status(401).end();
+    return;
+  }
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  const set = clients.get(userId) ?? new Set<Response>();
+  set.add(res);
+  clients.set(userId, set);
+
+  const ping = setInterval(() => {
+    res.write(`event: ping\ndata: {}\n\n`);
+  }, 25000);
+
+  req.on("close", () => {
+    clearInterval(ping);
+    set.delete(res);
+  });
+}
+
+export function publishToUser(userId: string, event: ServerEvent) {
+  const set = clients.get(userId);
+  if (!set) return;
+  const data = JSON.stringify(event);
+  for (const res of set) {
+    res.write(`event: ${event.kind}\n`);
+    res.write(`data: ${data}\n\n`);
+  }
+}
+
+=== path: packages/api/src/modules/notifications/notifications.router.ts ===
+import { Router } from "express";
+import { NotificationsService } from "./notifications.service";
+import type { Request, Response } from "express";
+import { sseHandler } from "./notifications.sse";
+
+const router = Router();
+
+function requireUser(req: Request, res: Response, next: Function) {
+  // Replace with your auth strategy. Accept x-user-id for dev/testing.
+  // @ts-ignore
+  const authed = req.user?.id as string | undefined;
+  const headerId = (req.headers["x-user-id"] as string) || undefined;
+  if (!authed && !headerId) return res.status(401).json({ error: "Unauthorized" });
+  // @ts-ignore
+  req.user = { id: authed ?? headerId };
+  next();
+}
+
+router.get("/stream", requireUser, sseHandler);
+
+router.get("/", requireUser, async (req, res) => {
+  // @ts-ignore
+  const userId = req.user.id as string;
+  const { status = "ALL", cursor, limit } = req.query;
+  const out = await NotificationsService.list(userId, {
+    status: String(status),
+    cursor: cursor ? String(cursor) : undefined,
+    limit: limit ? Number(limit) : undefined,
+  });
+  res.json(out);
+});
+
+router.patch("/:id/read", requireUser, async (req, res) => {
+  // @ts-ignore
+  const userId = req.user.id as string;
+  const ok = await NotificationsService.markRead(userId, req.params.id);
+  res.json({ ok });
+});
+
+router.post("/read-all", requireUser, async (req, res) => {
+  // @ts-ignore
+  const userId = req.user.id as string;
+  const count = await NotificationsService.markAllRead(userId);
+  res.json({ ok: true, count });
+});
+
+// Optional route to create a notification (useful for testing/admin)
+router.post("/", requireUser, async (req, res) => {
+  const payload = req.body;
+  const n = await NotificationsService.create(payload);
+  res.json(n);
+});
+
+export default router;
+
+=== path: packages/api/src/modules/notifications/index.ts ===
+export { default as notificationsRouter } from "./notifications.router";
+export { NotificationsService } from "./notifications.service";
+
+=== path: packages/api/src/server.mount-snippet.md ===
+Add this where you mount routes in your API server:
+
+```ts
+import notificationsRouter from "./modules/notifications/notifications.router";
+
+app.use("/notifications", notificationsRouter);
+```
+
+Also make sure to merge `prisma/partials/notifications.prisma` into your main Prisma schema and run a migration.
+
+=== path: apps/web/src/lib/sdk/notifications.ts ===
+import type { ListNotificationsQuery, NotificationDTO } from "@lockedin/contracts/notifications";
+import { apiFetch } from "./shared";
+
+export const NotificationsSDK = {
+  async list(query: ListNotificationsQuery = {}): Promise<{ items: NotificationDTO[]; nextCursor?: string }> {
+    const params = new URLSearchParams();
+    if (query.status && query.status !== "ALL") params.set("status", query.status);
+    if (query.cursor) params.set("cursor", query.cursor);
+    if (query.limit) params.set("limit", String(query.limit));
+    const res = await apiFetch(`/notifications?${params.toString()}`);
+    return res.json();
+  },
+
+  async markRead(id: string) {
+    const res = await apiFetch(`/notifications/${id}/read`, { method: "PATCH" });
+    return res.json();
+  },
+
+  async markAllRead() {
+    const res = await apiFetch(`/notifications/read-all`, { method: "POST" });
+    return res.json();
+  },
+
+  subscribe(onEvent: (evt: MessageEvent) => void) {
+    const url = `${window.__API_BASE__ ?? ""}/notifications/stream`;
+    const es = new EventSource(url, { withCredentials: true });
+    es.addEventListener("notification:new", (evt) => onEvent(evt as MessageEvent));
+    es.addEventListener("ping", () => {});
+    return () => es.close();
+  },
+};
+
+=== path: apps/web/src/lib/sdk/shared.ts ===
+/**
+ * Shared API helper. Replace auth header integration as needed.
+ */
+export function getAuthHeaders() {
+  const token = localStorage.getItem("auth_token"); // replace with your auth
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  // For local dev, also send x-user-id if set (server supports it)
+  const devUser = localStorage.getItem("dev_user_id");
+  if (devUser) headers["x-user-id"] = devUser;
+  return headers;
+}
+
+export function apiFetch(path: string, init: RequestInit = {}) {
+  const base = (window as any).__API_BASE__ || "";
+  const headers = { ...getAuthHeaders(), ...(init.headers || {}) };
+  return fetch(`${base}${path}`, { ...init, headers });
+}
+
+=== path: apps/web/src/components/notifications/NotificationBell.tsx ===
+import React, { useEffect, useState } from "react";
+import { BellIcon } from "lucide-react";
+import { NotificationsSDK } from "@/lib/sdk/notifications";
+
+export default function NotificationBell({ onClick }: { onClick?: () => void }) {
+  const [unread, setUnread] = useState(0);
+
+  useEffect(() => {
+    let unsub = () => {};
+    (async () => {
+      const { items } = await NotificationsSDK.list({ status: "UNREAD", limit: 1 });
+      setUnread(items.length > 0 ? items.length : 0);
+      unsub = NotificationsSDK.subscribe((evt) => {
+        try {
+          const data = JSON.parse((evt as MessageEvent).data);
+          if (data?.payload?.status === "UNREAD") setUnread((x) => x + 1);
+        } catch {}
+      });
+    })();
+    return () => unsub();
+  }, []);
+
+  return (
+    <button
+      onClick={onClick}
+      className="relative inline-flex items-center justify-center rounded-xl p-2 hover:bg-indigo-50 transition-colors"
+      aria-label="Notifications"
+    >
+      <BellIcon className="w-6 h-6 text-indigo-700" />
+      {unread > 0 && (
+        <span className="absolute -top-1 -right-1 text-[10px] leading-none font-bold bg-red-500 text-white px-1.5 py-0.5 rounded-full shadow">
+          {unread > 9 ? "9+" : unread}
+        </span>
+      )}
+    </button>
+  );
+}
+
+=== path: apps/web/src/components/notifications/NotificationsMenu.tsx ===
+import React, { useEffect, useState } from "react";
+import { Card } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { NotificationsSDK } from "@/lib/sdk/notifications";
+import type { NotificationDTO } from "@lockedin/contracts/notifications";
+import { ArrowRightIcon } from "lucide-react";
+import { Link } from "react-router-dom";
+
+function Item({ n, onRead }: { n: NotificationDTO; onRead: (id: string) => void }) {
+  return (
+    <div className="p-3 rounded-lg hover:bg-indigo-50/60 transition">
+      <div className="flex items-start gap-3">
+        <div className="mt-1">
+          <Badge className="bg-indigo-100 text-indigo-800">{n.type}</Badge>
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="font-medium text-gray-900">{n.title}</div>
+          <div className="text-sm text-gray-600 line-clamp-2">{n.body}</div>
+          <div className="flex items-center gap-2 mt-2">
+            {n.actionUrl && (
+              <a href={n.actionUrl} className="text-indigo-600 text-sm hover:underline flex items-center gap-1">
+                Open <ArrowRightIcon className="w-4 h-4" />
+              </a>
+            )}
+            {n.status === "UNREAD" && (
+              <Button size="xs" variant="outline" onClick={() => onRead(n.id)}>
+                Mark read
+              </Button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function NotificationsMenu() {
+  const [items, setItems] = useState<NotificationDTO[]>([]);
+
+  useEffect(() => {
+    let unsub = () => {};
+    (async () => {
+      const { items } = await NotificationsSDK.list({ limit: 10 });
+      setItems(items);
+      unsub = NotificationsSDK.subscribe((evt) => {
+        try {
+          const data = JSON.parse((evt as MessageEvent).data);
+          if (data?.payload) {
+            setItems((prev) => [data.payload, ...prev].slice(0, 10));
+          }
+        } catch {}
+      });
+    })();
+    return () => unsub();
+  }, []);
+
+  const markRead = async (id: string) => {
+    await NotificationsSDK.markRead(id);
+    setItems((prev) => prev.map((n) => (n.id === id ? { ...n, status: "READ", readAt: new Date().toISOString() } : n)));
+  };
+
+  const markAll = async () => {
+    await NotificationsSDK.markAllRead();
+    setItems((prev) => prev.map((n) => ({ ...n, status: "READ", readAt: new Date().toISOString() })));
+  };
+
+  return (
+    <Card className="w-96 max-w-[90vw] p-2 bg-white/90 backdrop-blur border border-gray-200 shadow-xl">
+      <div className="flex items-center justify-between p-2">
+        <div className="font-semibold text-gray-900">Notifications</div>
+        <div className="flex items-center gap-2">
+          <Button size="xs" variant="ghost" onClick={markAll}>Mark all read</Button>
+          <Link to="/notifications">
+            <Button size="xs" variant="outline">View all</Button>
+          </Link>
+        </div>
+      </div>
+      <div className="divide-y divide-gray-100 max-h-96 overflow-auto">
+        {items.length === 0 ? (
+          <div className="p-4 text-sm text-gray-500">No notifications yet.</div>
+        ) : (
+          items.map((n) => <Item key={n.id} n={n} onRead={markRead} />)
+        )}
+      </div>
+    </Card>
+  );
+}
+
+=== path: apps/web/src/pages/NotificationsPage.tsx ===
+import React, { useEffect, useState } from "react";
+import { NotificationsSDK } from "@/lib/sdk/notifications";
+import type { NotificationDTO } from "@lockedin/contracts/notifications";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { motion } from "framer-motion";
+
+export default function NotificationsPage() {
+  const [items, setItems] = useState<NotificationDTO[]>([]);
+  const [status, setStatus] = useState<"ALL" | "UNREAD" | "READ">("ALL");
+
+  useEffect(() => {
+    (async () => {
+      const { items } = await NotificationsSDK.list({ status, limit: 50 });
+      setItems(items);
+    })();
+  }, [status]);
+
+  const markAll = async () => {
+    await NotificationsSDK.markAllRead();
+    setItems((prev) => prev.map((n) => ({ ...n, status: "READ", readAt: new Date().toISOString() })));
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 via-white to-blue-50 p-6 md:p-8">
+      <div className="max-w-5xl mx-auto space-y-6">
+        <div className="flex items-center justify-between">
+          <h1 className="text-3xl font-bold text-gray-900">Notifications</h1>
+          <div className="flex items-center gap-2">
+            <select
+              className="border rounded-lg px-3 py-2 text-sm"
+              value={status}
+              onChange={(e) => setStatus(e.target.value as any)}
+            >
+              <option value="ALL">All</option>
+              <option value="UNREAD">Unread</option>
+              <option value="READ">Read</option>
+            </select>
+            <Button onClick={markAll} variant="outline">Mark all read</Button>
+          </div>
+        </div>
+
+        <Card className="bg-white/90 backdrop-blur border border-gray-200 shadow-lg">
+          <CardHeader>
+            <CardTitle className="text-lg">Recent</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {items.length === 0 ? (
+              <div className="text-sm text-gray-500">Nothing here yet.</div>
+            ) : (
+              items.map((n, idx) => (
+                <motion.div
+                  key={n.id}
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ delay: idx * 0.02 }}
+                  className="p-4 rounded-lg hover:bg-indigo-50/60 transition"
+                >
+                  <div className="flex items-start gap-3">
+                    <Badge variant="secondary" className="bg-indigo-100 text-indigo-800">{n.type}</Badge>
+                    <div className="flex-1">
+                      <div className="font-medium text-gray-900">{n.title}</div>
+                      <div className="text-sm text-gray-600">{n.body}</div>
+                      {n.actionUrl && (
+                        <a href={n.actionUrl} className="text-indigo-600 text-sm hover:underline mt-1 inline-block">
+                          Open
+                        </a>
+                      )}
+                    </div>
+                    <div className="text-xs text-gray-500">{new Date(n.createdAt).toLocaleString()}</div>
+                  </div>
+                </motion.div>
+              ))
+            )}
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+=== path: apps/web/src/routes/notifications.tsx ===
+import React from "react";
+import NotificationsPage from "@/pages/NotificationsPage";
+
+export default function NotificationsRoute() {
+  return <NotificationsPage />;
+}
+
+=== path: apps/web/src/components/layout/HeaderRightActions.tsx ===
+import React, { useState, useRef, useEffect } from "react";
+import NotificationBell from "@/components/notifications/NotificationBell";
+import NotificationsMenu from "@/components/notifications/NotificationsMenu";
+
+export default function HeaderRightActions() {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const onClick = (e: MouseEvent) => {
+      if (!ref.current) return;
+      if (!ref.current.contains(e.target as any)) setOpen(false);
+    };
+    document.addEventListener("click", onClick);
+    return () => document.removeEventListener("click", onClick);
+  }, []);
+
+  return (
+    <div className="relative" ref={ref}>
+      <NotificationBell onClick={() => setOpen((o) => !o)} />
+      {open && (
+        <div className="absolute right-0 mt-2 z-50">
+          <NotificationsMenu />
+        </div>
+      )}
+    </div>
+  );
+}
+
+=== path: apps/web/src/README.notifications.md ===
+# Notifications Module (Bundle 14)
+
+This bundle adds end-to-end notifications:
+- Prisma model & enums
+- API: list, mark read, mark all, SSE stream
+- Web: bell, dropdown menu, notifications page
+- Contracts & SDK
+
+## Install & Migrate
+
+1. Merge `packages/api/prisma/partials/notifications.prisma` into your main Prisma schema.
+2. Run migration:
+   ```bash
+   pnpm -w prisma generate
+   pnpm -w prisma migrate dev -n "notifications"
+   ```
+3. Mount router in API:
+   ```ts
+   import notificationsRouter from "./modules/notifications/notifications.router";
+   app.use("/notifications", notificationsRouter);
+   ```
+4. On the web app, ensure `window.__API_BASE__` is set (e.g., via env injection) and auth headers return a token or `x-user-id` in dev.
+
+## Dev Test
+
+- In browser devtools, set a dev user id:
+  ```js
+  localStorage.setItem("dev_user_id", "USER_ID_FROM_DB")
+  ```
+- Create a test notification with curl or Postman:
+  ```bash
+  curl -X POST "$API_BASE/notifications" \
+    -H "Content-Type: application/json" \
+    -H "x-user-id: ADMIN_OR_YOUR_USER" \
+    -d '{
+      "userId": "USER_ID_FROM_DB",
+      "type": "SYSTEM",
+      "title": "Welcome to LockedIn!",
+      "body": "You will see personalized job matches here.",
+      "source": "system"
+    }'
+  ```
+
+You should see the bell badge increment and the dropdown update in real time.
+
+## Notes
+
+- SSE is used for simplicity; you can swap to WebSockets later without changing the UI much.
+- Respect youth safety: only generate contact-initiated notifications from verified employers for under-18 accounts.

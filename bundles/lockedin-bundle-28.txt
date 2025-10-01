@@ -1,0 +1,852 @@
+
+BUNDLE 28 — Employer Verification & Trusted Job Posting Pipeline
+================================================================
+
+Goal
+----
+Introduce a full "Trusted Employers" system that:
+- Verifies organizations before they can message minors or post youth‑friendly jobs
+- Enforces pay transparency requirements and basic anti‑fraud checks
+- Surfaces trust signals (badges, verified pay, verified org) across the app
+- Adds an admin verification queue + worker to process verification flows
+- Hooks into Job posting to block risky/low‑quality listings automatically
+
+How to install
+--------------
+1) Merge the files below into your repo (same relative paths).
+2) Run Prisma migration: `npm run prisma:generate && npm run prisma:migrate`
+3) Restart API server and the background worker.
+4) In the dashboard, log in as an admin and approve/deny employer requests.
+5) Try posting a job with and without verification to see validations and badges.
+
+File Tree (in this bundle)
+--------------------------
+backend/
+  prisma/
+    migrations/
+      2025XXXX_add_employer_verification/
+        migration.sql
+  src/
+    config/payTransparency.ts
+    middleware/trust.ts
+    modules/verification/entities.ts
+    modules/verification/service.ts
+    modules/verification/routes.ts
+    modules/verification/moderation.ts
+    modules/verification/email.ts
+    modules/jobs/jobValidation.ts
+    workers/verificationWorker.ts
+frontend/
+  src/components/VerificationBadge.tsx
+  src/pages/employer/VerificationStart.tsx
+  src/pages/employer/VerificationStatus.tsx
+  src/pages/employer/PostJob.tsx
+  src/pages/admin/VerificationQueue.tsx
+emails/
+  verification-submitted.html
+  verification-approved.html
+  verification-rejected.html
+  verification-submitted.txt
+  verification-approved.txt
+  verification-rejected.txt
+
+--------------------------------------------------------------------------------
+PATH: backend/prisma/migrations/2025XXXX_add_employer_verification/migration.sql
+--------------------------------------------------------------------------------
+-- Prisma SQL migration to add Employer, EmployerVerification, and constraints.
+
+-- Organizations/Employers table
+CREATE TABLE IF NOT EXISTS "Employer" (
+  "id" TEXT PRIMARY KEY,
+  "name" TEXT NOT NULL,
+  "website" TEXT,
+  "domain" TEXT,
+  "logoUrl" TEXT,
+  "createdAt" TIMESTAMP NOT NULL DEFAULT NOW(),
+  "updatedAt" TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- Link between user account and employer (staff/owner)
+CREATE TABLE IF NOT EXISTS "EmployerUser" (
+  "id" TEXT PRIMARY KEY,
+  "userId" TEXT NOT NULL,
+  "employerId" TEXT NOT NULL,
+  "role" TEXT NOT NULL DEFAULT 'ADMIN', -- ADMIN|RECRUITER|HIRING_MANAGER
+  "createdAt" TIMESTAMP NOT NULL DEFAULT NOW(),
+  UNIQUE ("userId","employerId")
+);
+
+-- Verification workflow
+CREATE TABLE IF NOT EXISTS "EmployerVerification" (
+  "id" TEXT PRIMARY KEY,
+  "employerId" TEXT NOT NULL,
+  "status" TEXT NOT NULL DEFAULT 'PENDING', -- PENDING|APPROVED|REJECTED|NEEDS_MORE_INFO
+  "submittedByUserId" TEXT NOT NULL,
+  "docs" JSONB, -- { taxId, docs[], linkedinLike, govRegistry, etc } (no secrets stored here)
+  "notes" TEXT,
+  "rejectionReason" TEXT,
+  "approvedAt" TIMESTAMP,
+  "reviewedByUserId" TEXT,
+  "createdAt" TIMESTAMP NOT NULL DEFAULT NOW(),
+  "updatedAt" TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- Lightweight audit table for status changes
+CREATE TABLE IF NOT EXISTS "EmployerVerificationEvent" (
+  "id" TEXT PRIMARY KEY,
+  "verificationId" TEXT NOT NULL,
+  "type" TEXT NOT NULL, -- SUBMITTED|APPROVED|REJECTED|ASKED_INFO
+  "byUserId" TEXT,
+  "payload" JSONB,
+  "createdAt" TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- Add trust columns to Job
+ALTER TABLE "Job" ADD COLUMN IF NOT EXISTS "employerId" TEXT;
+ALTER TABLE "Job" ADD COLUMN IF NOT EXISTS "verifiedCompany" BOOLEAN DEFAULT FALSE;
+ALTER TABLE "Job" ADD COLUMN IF NOT EXISTS "verifiedPay" BOOLEAN DEFAULT FALSE;
+ALTER TABLE "Job" ADD COLUMN IF NOT EXISTS "youthSafe" BOOLEAN DEFAULT FALSE;
+
+-- Indices
+CREATE INDEX IF NOT EXISTS "idx_employer_domain" ON "Employer" ("domain");
+CREATE INDEX IF NOT EXISTS "idx_verifications_employer" ON "EmployerVerification" ("employerId");
+
+-- (FKs depend on your existing tables; add them if your DB supports it)
+-- ALTER TABLE "EmployerUser" ADD CONSTRAINT ...
+
+--------------------------------------------------------------------------------
+PATH: backend/src/config/payTransparency.ts
+--------------------------------------------------------------------------------
+/**
+ * Declarative pay transparency rules by region.
+ * NOTE: This is NOT legal advice. Keep this table updated by your team.
+ */
+export type PayRule = {
+  region: string;
+  requireRange: boolean;
+  requireType: boolean; // salary/hourly/stipend
+  minDisclosure: "RANGE" | "MIN_ONLY" | "NONE";
+};
+
+export const PAY_RULES: PayRule[] = [
+  { region: "US-CA", requireRange: true, requireType: true, minDisclosure: "RANGE" },
+  { region: "US-NY", requireRange: true, requireType: true, minDisclosure: "RANGE" },
+  { region: "US-WA", requireRange: true, requireType: true, minDisclosure: "RANGE" },
+  // Fallback: allow jobs without ranges where not required
+  { region: "DEFAULT", requireRange: false, requireType: true, minDisclosure: "NONE" }
+];
+
+/** Pick the best matching pay rule by region code like "US-CA" or country code. */
+export function resolvePayRule(regionCode?: string): PayRule {
+  if (!regionCode) return PAY_RULES.find(r => r.region === "DEFAULT")!;
+  return PAY_RULES.find(r => r.region === regionCode) ?? PAY_RULES.find(r => r.region === "DEFAULT")!;
+}
+
+--------------------------------------------------------------------------------
+PATH: backend/src/middleware/trust.ts
+--------------------------------------------------------------------------------
+import { Request, Response, NextFunction } from "express";
+
+/**
+ * Injects `req.trust` context used by job validation and youth safety gating.
+ */
+export function trustContext(req: Request, _res: Response, next: NextFunction) {
+  const isMinor = req.user?.ageMode === "YOUTH";
+  const employerId = req.user?.employerId ?? null;
+  req.trust = { isMinor, employerId, isEmployer: !!employerId };
+  next();
+}
+
+// Extend Express typings (you likely have a types.d.ts; merge there)
+declare global {
+  namespace Express {
+    interface Request {
+      trust?: {
+        isMinor?: boolean;
+        employerId?: string | null;
+        isEmployer?: boolean;
+      };
+    }
+  }
+}
+
+--------------------------------------------------------------------------------
+PATH: backend/src/modules/verification/entities.ts
+--------------------------------------------------------------------------------
+export type VerificationStatus = "PENDING" | "APPROVED" | "REJECTED" | "NEEDS_MORE_INFO";
+
+export interface Employer {
+  id: string;
+  name: string;
+  website?: string;
+  domain?: string;
+  logoUrl?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EmployerUser {
+  id: string;
+  userId: string;
+  employerId: string;
+  role: "ADMIN" | "RECRUITER" | "HIRING_MANAGER";
+  createdAt: string;
+}
+
+export interface EmployerVerification {
+  id: string;
+  employerId: string;
+  status: VerificationStatus;
+  submittedByUserId: string;
+  docs?: Record<string, unknown>;
+  notes?: string;
+  rejectionReason?: string;
+  approvedAt?: string;
+  reviewedByUserId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EmployerVerificationEvent {
+  id: string;
+  verificationId: string;
+  type: "SUBMITTED" | "APPROVED" | "REJECTED" | "ASKED_INFO";
+  byUserId?: string;
+  payload?: Record<string, unknown>;
+  createdAt: string;
+}
+
+--------------------------------------------------------------------------------
+PATH: backend/src/modules/verification/service.ts
+--------------------------------------------------------------------------------
+import { randomUUID } from "crypto";
+import type { EmployerVerification, EmployerVerificationEvent, VerificationStatus } from "./entities";
+import { sendVerificationSubmitted, sendVerificationApproved, sendVerificationRejected } from "./email";
+
+type Db = {
+  Employer: any;
+  EmployerUser: any;
+  EmployerVerification: any;
+  EmployerVerificationEvent: any;
+  Job: any;
+};
+
+export class VerificationService {
+  constructor(private db: Db) {}
+
+  async submitVerification(employerId: string, submittedByUserId: string, docs: Record<string, unknown>, notes?: string) {
+    const v: EmployerVerification = {
+      id: randomUUID(),
+      employerId,
+      status: "PENDING",
+      submittedByUserId,
+      docs,
+      notes,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    } as EmployerVerification;
+
+    await this.db.EmployerVerification.create({ data: v });
+    const e: EmployerVerificationEvent = {
+      id: randomUUID(),
+      verificationId: v.id,
+      type: "SUBMITTED",
+      byUserId: submittedByUserId,
+      createdAt: new Date().toISOString()
+    };
+    await this.db.EmployerVerificationEvent.create({ data: e });
+
+    await sendVerificationSubmitted(employerId);
+    return v;
+  }
+
+  async updateStatus(verificationId: string, adminUserId: string, status: VerificationStatus, opts?: { reason?: string }) {
+    const v = await this.db.EmployerVerification.findUnique({ where: { id: verificationId } });
+    if (!v) throw new Error("Verification not found");
+
+    const updateData: Partial<EmployerVerification> = {
+      status,
+      reviewedByUserId: adminUserId,
+      updatedAt: new Date().toISOString(),
+      approvedAt: status === "APPROVED" ? new Date().toISOString() : null
+    };
+    if (status === "REJECTED" && opts?.reason) updateData.rejectionReason = opts.reason;
+
+    await this.db.EmployerVerification.update({ where: { id: verificationId }, data: updateData });
+
+    await this.db.EmployerVerificationEvent.create({
+      data: {
+        id: randomUUID(),
+        verificationId,
+        type: status === "APPROVED" ? "APPROVED" : status === "REJECTED" ? "REJECTED" : "ASKED_INFO",
+        byUserId: adminUserId,
+        createdAt: new Date().toISOString()
+      }
+    });
+
+    if (status === "APPROVED") {
+      // Flip verifiedCompany on all existing jobs by this employer
+      await this.db.Job.updateMany({ where: { employerId: v.employerId }, data: { verifiedCompany: true } });
+      await sendVerificationApproved(v.employerId);
+    } else if (status === "REJECTED") {
+      await sendVerificationRejected(v.employerId, opts?.reason ?? "");
+    }
+  }
+
+  async isEmployerVerified(employerId: string): Promise<boolean> {
+    const v = await this.db.EmployerVerification.findFirst({ where: { employerId, status: "APPROVED" } });
+    return !!v;
+  }
+}
+
+--------------------------------------------------------------------------------
+PATH: backend/src/modules/verification/routes.ts
+--------------------------------------------------------------------------------
+import { Router } from "express";
+import { VerificationService } from "./service";
+import { requireAuth, requireAdmin } from "../../shared/auth"; // replace with your auth guards
+
+export function verificationRoutes(db: any) {
+  const r = Router();
+  const svc = new VerificationService(db);
+
+  r.post("/employer/verify/submit", requireAuth, async (req, res) => {
+    const employerId = req.user?.employerId;
+    if (!employerId) return res.status(403).json({ error: "Not an employer account" });
+    const { docs, notes } = req.body ?? {};
+    const v = await svc.submitVerification(employerId, req.user!.id, docs ?? {}, notes);
+    res.json({ ok: true, verification: v });
+  });
+
+  r.get("/employer/verify/status", requireAuth, async (req, res) => {
+    const employerId = req.user?.employerId;
+    if (!employerId) return res.status(403).json({ error: "Not an employer account" });
+    const records = await db.EmployerVerification.findMany({ where: { employerId }, orderBy: { createdAt: "desc" } });
+    res.json({ ok: true, records });
+  });
+
+  // Admin moderation
+  r.get("/admin/verify/queue", requireAdmin, async (_req, res) => {
+    const queue = await db.EmployerVerification.findMany({ where: { status: "PENDING" }, orderBy: { createdAt: "asc" } });
+    res.json({ ok: true, queue });
+  });
+
+  r.post("/admin/verify/:id/approve", requireAdmin, async (req, res) => {
+    await svc.updateStatus(req.params.id, req.user!.id, "APPROVED");
+    res.json({ ok: true });
+  });
+
+  r.post("/admin/verify/:id/reject", requireAdmin, async (req, res) => {
+    const { reason } = req.body ?? {};
+    await svc.updateStatus(req.params.id, req.user!.id, "REJECTED", { reason });
+    res.json({ ok: true });
+  });
+
+  return r;
+}
+
+--------------------------------------------------------------------------------
+PATH: backend/src/modules/verification/moderation.ts
+--------------------------------------------------------------------------------
+import { resolvePayRule } from "../../config/payTransparency";
+
+/**
+ * Basic quality and safety checks for jobs before publication.
+ * This is intentionally conservative for youth-safe postings.
+ */
+export function validateJobDraft(job: any, ctx: { employerVerified: boolean; regionCode?: string; isYouthJob?: boolean }) {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  if (!job.title || job.title.length < 3) errors.push("Title is too short");
+  if (!job.description || job.description.length < 50) errors.push("Description must be at least 50 characters");
+
+  // Pay transparency
+  const rule = resolvePayRule(ctx.regionCode);
+  if (rule.requireType && !job.pay_type) errors.push("Pay type is required for this region");
+  if (rule.requireRange && (!job.pay_min || !job.pay_max)) errors.push("Pay range is required for this region");
+
+  // Youth-safety
+  if (ctx.isYouthJob) {
+    if (!ctx.employerVerified) errors.push("Employer must be verified to post youth-friendly roles");
+    if (job.location_type !== "REMOTE" && !job.locations?.length) {
+      warnings.push("Youth roles should list a specific safe location or be remote");
+    }
+  }
+
+  // Anti-fraud heuristics
+  const suspicious = /(bitcoin|crypto wallet|wire transfer|pay to apply|training fee)/i;
+  if (suspicious.test(job.description)) errors.push("Posting contains disallowed payment language");
+
+  return { errors, warnings };
+}
+
+--------------------------------------------------------------------------------
+PATH: backend/src/modules/verification/email.ts
+--------------------------------------------------------------------------------
+/**
+ * Email hooks (pretend integration). DO NOT put secrets here.
+ * You can wire real providers via env vars in your mailer module.
+ */
+export async function sendVerificationSubmitted(employerId: string) {
+  console.log(`[mail] Employer ${employerId} submitted verification`);
+}
+export async function sendVerificationApproved(employerId: string) {
+  console.log(`[mail] Employer ${employerId} approved`);
+}
+export async function sendVerificationRejected(employerId: string, reason: string) {
+  console.log(`[mail] Employer ${employerId} rejected: ${reason}`);
+}
+
+--------------------------------------------------------------------------------
+PATH: backend/src/modules/jobs/jobValidation.ts
+--------------------------------------------------------------------------------
+import type { Request, Response, NextFunction } from "express";
+import { validateJobDraft } from "../verification/moderation";
+
+/**
+ * Middleware to validate jobs on creation/update.
+ * Assumes req.db and req.user are set by your framework.
+ */
+export async function jobValidation(req: Request, res: Response, next: NextFunction) {
+  try {
+    const employerId = req.user?.employerId;
+    const employerVerified = employerId
+      ? !!(await req.db.EmployerVerification.findFirst({ where: { employerId, status: "APPROVED" } }))
+      : false;
+
+    const isYouthJob = !!req.body?.open_to_minors || !!req.body?.youthSafe;
+    const regionCode = req.body?.regionCode; // e.g. "US-CA"
+
+    const { errors, warnings } = validateJobDraft(req.body, { employerVerified, regionCode, isYouthJob });
+    if (errors.length) return res.status(400).json({ ok: false, errors, warnings });
+
+    // Attach trust flags
+    req.body.verifiedCompany = employerVerified;
+    req.body.youthSafe = isYouthJob && employerVerified;
+
+    // Pay verification is separate; you can set verifiedPay after document review
+    next();
+  } catch (e) {
+    next(e);
+  }
+}
+
+--------------------------------------------------------------------------------
+PATH: backend/src/workers/verificationWorker.ts
+--------------------------------------------------------------------------------
+/**
+ * Background worker skeleton that polls for pending verifications and
+ * runs heuristics (domain checks, MX lookup, company registry ping, etc.).
+ * Replace stubs with real checks/services in your infra.
+ */
+import { setTimeout as delay } from "timers/promises";
+
+export async function runVerificationWorker(db: any, opts: { intervalMs?: number } = {}) {
+  const interval = opts.intervalMs ?? 15000;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    try {
+      const pending = await db.EmployerVerification.findMany({ where: { status: "PENDING" }, take: 25 });
+      for (const v of pending) {
+        // Example heuristic: auto-approve if email domain matches website domain
+        const employer = await db.Employer.findUnique({ where: { id: v.employerId } });
+        if (employer?.domain && v.docs?.["officialEmailDomain"] === employer.domain) {
+          // (You might still want manual review; mark NEEDS_MORE_INFO instead)
+          // await db.EmployerVerification.update({ where: { id: v.id }, data: { status: "NEEDS_MORE_INFO" }});
+        }
+      }
+    } catch (err) {
+      console.error("[verificationWorker] error", err);
+    }
+    await delay(interval);
+  }
+}
+
+--------------------------------------------------------------------------------
+PATH: frontend/src/components/VerificationBadge.tsx
+--------------------------------------------------------------------------------
+import React from "react";
+
+type Props = {
+  verified?: boolean;
+  verifiedPay?: boolean;
+  size?: "sm" | "md";
+};
+
+export default function VerificationBadge({ verified, verifiedPay, size = "md" }: Props) {
+  const text = verified ? "Verified Employer" : "Unverified Employer";
+  const base = size === "sm" ? "text-xs px-2 py-0.5" : "text-sm px-3 py-1";
+  return (
+    <div className="flex items-center gap-2">
+      <span className={`${base} rounded-full border ${verified ? "bg-emerald-50 border-emerald-200 text-emerald-700" : "bg-gray-50 border-gray-200 text-gray-600"}`}>
+        {text}
+      </span>
+      {verifiedPay && (
+        <span className={`${base} rounded-full border bg-blue-50 border-blue-200 text-blue-700`}>Verified Pay</span>
+      )}
+    </div>
+  );
+}
+
+--------------------------------------------------------------------------------
+PATH: frontend/src/pages/employer/VerificationStart.tsx
+--------------------------------------------------------------------------------
+import React, { useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+
+export default function VerificationStart() {
+  const [website, setWebsite] = useState("");
+  const [officialEmailDomain, setOfficialEmailDomain] = useState("");
+  const [notes, setNotes] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [ok, setOk] = useState(false);
+
+  async function submit() {
+    setSubmitting(true);
+    try {
+      const res = await fetch("/api/employer/verify/submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ docs: { website, officialEmailDomain }, notes })
+      });
+      const data = await res.json();
+      if (data.ok) setOk(true);
+      else alert((data.errors && data.errors.join(", ")) || "Submission failed");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  if (ok) {
+    return (
+      <Card className="max-w-2xl mx-auto">
+        <CardHeader><CardTitle>Verification Submitted</CardTitle></CardHeader>
+        <CardContent>
+          <p className="text-gray-600">We’ll review your details and notify you by email. You can track status on the next page.</p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card className="max-w-2xl mx-auto">
+      <CardHeader><CardTitle>Verify Your Organization</CardTitle></CardHeader>
+      <CardContent className="space-y-4">
+        <div>
+          <label className="text-sm font-medium">Company Website</label>
+          <Input placeholder="https://yourcompany.com" value={website} onChange={e => setWebsite(e.target.value)} />
+        </div>
+        <div>
+          <label className="text-sm font-medium">Official Email Domain</label>
+          <Input placeholder="yourcompany.com" value={officialEmailDomain} onChange={e => setOfficialEmailDomain(e.target.value)} />
+        </div>
+        <div>
+          <label className="text-sm font-medium">Notes (optional)</label>
+          <Textarea placeholder="Anything else that helps us verify you…" value={notes} onChange={e => setNotes(e.target.value)} />
+        </div>
+        <Button onClick={submit} disabled={submitting}>{submitting ? "Submitting…" : "Submit for Review"}</Button>
+      </CardContent>
+    </Card>
+  );
+}
+
+--------------------------------------------------------------------------------
+PATH: frontend/src/pages/employer/VerificationStatus.tsx
+--------------------------------------------------------------------------------
+import React, { useEffect, useState } from "react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+
+type RecordItem = {
+  id: string;
+  status: "PENDING" | "APPROVED" | "REJECTED" | "NEEDS_MORE_INFO";
+  createdAt: string;
+  rejectionReason?: string;
+};
+
+export default function VerificationStatus() {
+  const [records, setRecords] = useState<RecordItem[]>([]);
+
+  useEffect(() => {
+    fetch("/api/employer/verify/status").then(r => r.json()).then(d => setRecords(d.records || []));
+  }, []);
+
+  return (
+    <Card className="max-w-3xl mx-auto">
+      <CardHeader><CardTitle>Verification Status</CardTitle></CardHeader>
+      <CardContent>
+        <div className="space-y-3">
+          {records.map(r => (
+            <div key={r.id} className="p-3 rounded border">
+              <div className="flex items-center justify-between">
+                <span className="font-medium">{r.status}</span>
+                <span className="text-xs text-gray-500">{new Date(r.createdAt).toLocaleString()}</span>
+              </div>
+              {r.rejectionReason && <p className="text-sm text-red-600 mt-2">Reason: {r.rejectionReason}</p>}
+            </div>
+          ))}
+          {!records.length && <p className="text-gray-500">No submissions yet.</p>}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+--------------------------------------------------------------------------------
+PATH: frontend/src/pages/employer/PostJob.tsx
+--------------------------------------------------------------------------------
+import React, { useEffect, useState } from "react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Button } from "@/components/ui/button";
+import VerificationBadge from "@/components/VerificationBadge";
+
+type Draft = {
+  title: string;
+  description: string;
+  pay_min?: number;
+  pay_max?: number;
+  pay_type?: "SALARY" | "HOURLY" | "STIPEND";
+  location_type?: "REMOTE" | "ONSITE" | "HYBRID";
+  locations?: string[];
+  open_to_minors?: boolean;
+  regionCode?: string;
+};
+
+export default function PostJob() {
+  const [draft, setDraft] = useState<Draft>({ title: "", description: "" });
+  const [verified, setVerified] = useState<boolean>(false);
+  const [errors, setErrors] = useState<string[]>([]);
+  const [warnings, setWarnings] = useState<string[]>([]);
+
+  useEffect(() => {
+    // Fetch employer verification state if you have an endpoint for it
+    fetch("/api/employer/verify/status").then(r => r.json()).then(d => {
+      const hasApproved = (d.records || []).some((x: any) => x.status === "APPROVED");
+      setVerified(hasApproved);
+    });
+  }, []);
+
+  async function submit() {
+    setErrors([]); setWarnings([]);
+    const res = await fetch("/api/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(draft) });
+    const data = await res.json();
+    if (!data.ok) {
+      setErrors(data.errors || []);
+      setWarnings(data.warnings || []);
+      return;
+    }
+    alert("Job posted!");
+  }
+
+  return (
+    <Card className="max-w-3xl mx-auto">
+      <CardHeader className="flex items-center justify-between">
+        <CardTitle>Post a Job</CardTitle>
+        <VerificationBadge verified={verified} />
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {errors.length > 0 && (
+          <div className="p-3 rounded bg-red-50 border border-red-200 text-red-700 text-sm">
+            <strong>Fix these before posting:</strong>
+            <ul className="list-disc ml-5">{errors.map((e, i) => <li key={i}>{e}</li>)}</ul>
+          </div>
+        )}
+        {warnings.length > 0 && (
+          <div className="p-3 rounded bg-yellow-50 border border-yellow-200 text-yellow-800 text-sm">
+            <strong>Suggestions:</strong>
+            <ul className="list-disc ml-5">{warnings.map((w, i) => <li key={i}>{w}</li>)}</ul>
+          </div>
+        )}
+        <div>
+          <label className="text-sm font-medium">Title</label>
+          <Input value={draft.title} onChange={e => setDraft({ ...draft, title: e.target.value })} />
+        </div>
+        <div>
+          <label className="text-sm font-medium">Description</label>
+          <Textarea rows={8} value={draft.description} onChange={e => setDraft({ ...draft, description: e.target.value })} />
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="text-sm font-medium">Pay Type</label>
+            <select className="w-full border rounded px-3 py-2"
+              value={draft.pay_type ?? ""}
+              onChange={e => setDraft({ ...draft, pay_type: e.target.value as any })}>
+              <option value="">Select</option>
+              <option value="SALARY">Salary</option>
+              <option value="HOURLY">Hourly</option>
+              <option value="STIPEND">Stipend</option>
+            </select>
+          </div>
+          <div>
+            <label className="text-sm font-medium">Region Code</label>
+            <Input placeholder="US-CA" value={draft.regionCode ?? ""} onChange={e => setDraft({ ...draft, regionCode: e.target.value })} />
+          </div>
+          <div>
+            <label className="text-sm font-medium">Min Pay</label>
+            <Input type="number" value={draft.pay_min ?? 0} onChange={e => setDraft({ ...draft, pay_min: Number(e.target.value) })} />
+          </div>
+            <div>
+            <label className="text-sm font-medium">Max Pay</label>
+            <Input type="number" value={draft.pay_max ?? 0} onChange={e => setDraft({ ...draft, pay_max: Number(e.target.value) })} />
+          </div>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="text-sm font-medium">Location Type</label>
+            <select className="w-full border rounded px-3 py-2"
+              value={draft.location_type ?? ""}
+              onChange={e => setDraft({ ...draft, location_type: e.target.value as any })}>
+              <option value="">Select</option>
+              <option value="REMOTE">Remote</option>
+              <option value="ONSITE">On-site</option>
+              <option value="HYBRID">Hybrid</option>
+            </select>
+          </div>
+          <div>
+            <label className="text-sm font-medium">Youth-Friendly</label>
+            <select className="w-full border rounded px-3 py-2"
+              value={String(draft.open_to_minors ?? false)}
+              onChange={e => setDraft({ ...draft, open_to_minors: e.target.value === "true" })}>
+              <option value="false">No</option>
+              <option value="true">Yes</option>
+            </select>
+          </div>
+        </div>
+        <Button onClick={submit}>Publish Job</Button>
+      </CardContent>
+    </Card>
+  );
+}
+
+--------------------------------------------------------------------------------
+PATH: frontend/src/pages/admin/VerificationQueue.tsx
+--------------------------------------------------------------------------------
+import React, { useEffect, useState } from "react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+
+type Item = {
+  id: string;
+  employerId: string;
+  createdAt: string;
+  docs?: any;
+  notes?: string;
+};
+
+export default function VerificationQueue() {
+  const [items, setItems] = useState<Item[]>([]);
+  const [reasons, setReasons] = useState<Record<string,string>>({});
+
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  async function refresh() {
+    const res = await fetch("/api/admin/verify/queue");
+    const data = await res.json();
+    setItems(data.queue || []);
+  }
+
+  async function approve(id: string) {
+    await fetch(`/api/admin/verify/${id}/approve`, { method: "POST" });
+    refresh();
+  }
+  async function reject(id: string) {
+    await fetch(`/api/admin/verify/${id}/reject`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason: reasons[id] || "" }) });
+    refresh();
+  }
+
+  return (
+    <Card className="max-w-5xl mx-auto">
+      <CardHeader><CardTitle>Employer Verification Queue</CardTitle></CardHeader>
+      <CardContent className="space-y-4">
+        {items.map(i => (
+          <div key={i.id} className="p-4 border rounded space-y-3">
+            <div className="text-sm text-gray-500">Submitted {new Date(i.createdAt).toLocaleString()}</div>
+            <pre className="text-xs bg-gray-50 p-3 rounded overflow-auto">{JSON.stringify(i.docs ?? {}, null, 2)}</pre>
+            {i.notes && <p className="text-sm">{i.notes}</p>}
+            <div className="grid grid-cols-2 gap-3">
+              <Button onClick={() => approve(i.id)} className="bg-emerald-600 hover:bg-emerald-700">Approve</Button>
+              <div className="space-y-2">
+                <Textarea placeholder="Reason (optional)" value={reasons[i.id] ?? ""} onChange={e => setReasons({ ...reasons, [i.id]: e.target.value })} />
+                <Button onClick={() => reject(i.id)} variant="destructive">Reject</Button>
+              </div>
+            </div>
+          </div>
+        ))}
+        {!items.length && <p className="text-gray-500">No pending requests.</p>}
+      </CardContent>
+    </Card>
+  );
+}
+
+--------------------------------------------------------------------------------
+PATH: emails/verification-submitted.html
+--------------------------------------------------------------------------------
+<!doctype html>
+<html>
+  <body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;">
+    <h2>We received your verification</h2>
+    <p>Thanks for submitting your organization details. Our team will review them shortly.</p>
+  </body>
+</html>
+
+--------------------------------------------------------------------------------
+PATH: emails/verification-approved.html
+--------------------------------------------------------------------------------
+<!doctype html>
+<html>
+  <body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;">
+    <h2>Your organization is verified ✅</h2>
+    <p>You can now post youth-friendly roles and display a verified badge on listings.</p>
+  </body>
+</html>
+
+--------------------------------------------------------------------------------
+PATH: emails/verification-rejected.html
+--------------------------------------------------------------------------------
+<!doctype html>
+<html>
+  <body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;">
+    <h2>We couldn’t verify your organization</h2>
+    <p>Please review your submission and try again. If you believe this is a mistake, reply to this email.</p>
+  </body>
+</html>
+
+--------------------------------------------------------------------------------
+PATH: emails/verification-submitted.txt
+--------------------------------------------------------------------------------
+We received your verification
+
+Thanks for submitting your organization details. Our team will review them shortly.
+
+--------------------------------------------------------------------------------
+PATH: emails/verification-approved.txt
+--------------------------------------------------------------------------------
+Your organization is verified
+
+You can now post youth-friendly roles and display a verified badge on listings.
+
+--------------------------------------------------------------------------------
+PATH: emails/verification-rejected.txt
+--------------------------------------------------------------------------------
+We couldn’t verify your organization
+
+Please review your submission and try again. If you believe this is a mistake, reply to this email.
+
+--------------------------------------------------------------------------------
+NOTES
+--------------------------------------------------------------------------------
+- Wire `verificationRoutes` in your API server under `/api`.
+- Apply `trustContext` middleware globally after auth to populate `req.trust`.
+- Attach `jobValidation` middleware to POST/PUT job routes to enforce rules.
+- Add a cron or separate process for `runVerificationWorker` with DB access.
+- Keep PAY_RULES updated for your target markets; expose region picker in PostJob.
+- Trust badges: use `<VerificationBadge verified={job.verifiedCompany} verifiedPay={job.verifiedPay} />` in cards and detail pages.
+- Zero secrets included. Use environment variables for actual email/S3/queue providers.

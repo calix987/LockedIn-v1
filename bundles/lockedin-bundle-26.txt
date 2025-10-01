@@ -1,0 +1,887 @@
+# LockedIn — Bundle 26
+# Trust & Safety: Moderation, Reporting, Blocking, Youth Safeguards, Employer Verification
+# Monorepo-relative paths below. Drop-in compatible with prior bundles (00–25). No secrets included.
+
+──────────────────────────────────────────────────────────────────────────────
+Directory Map
+──────────────────────────────────────────────────────────────────────────────
+services/api/src/modules/moderation/
+  ├─ index.ts
+  ├─ entities.ts
+  ├─ policies.ts
+  ├─ service.ts
+  ├─ controller.ts
+  ├─ routes.ts
+  ├─ queue.ts
+  ├─ heuristics.ts
+  └─ __tests__/moderation.service.spec.ts
+
+services/api/src/modules/reports/
+  ├─ index.ts
+  ├─ entities.ts
+  ├─ service.ts
+  ├─ controller.ts
+  ├─ routes.ts
+  └─ __tests__/reports.service.spec.ts
+
+services/api/src/modules/safety/
+  ├─ index.ts
+  ├─ entities.ts
+  ├─ service.ts
+  ├─ controller.ts
+  ├─ routes.ts
+  ├─ middlewares.ts
+  ├─ employerVerification.ts
+  └─ __tests__/safety.service.spec.ts
+
+services/api/src/common/
+  ├─ authz.ts
+  ├─ audit.ts
+  ├─ errors.ts
+  ├─ types.ts
+  └─ pagination.ts
+
+services/api/prisma/migrations/2025XXXX_moderation_and_safety/
+  └─ migration.sql
+
+apps/web/src/features/safety/
+  ├─ SafetyCenter.tsx
+  ├─ BlockedList.tsx
+  ├─ VerificationRequestForm.tsx
+  ├─ ReportDialog.tsx
+  ├─ ModerationConsole.tsx   (admin)
+  └─ hooks.ts
+
+apps/web/src/features/social/components/withReportable.tsx
+apps/web/src/features/messaging/MessageActions.tsx
+apps/web/src/features/jobs/JobCardExtras.tsx
+apps/web/src/routes/safety/index.tsx
+
+packages/shared/src/types/moderation.ts
+packages/shared/src/types/safety.ts
+packages/shared/src/enums.ts
+
+scripts/seed/seed_safety_policies.ts
+
+──────────────────────────────────────────────────────────────────────────────
+Backend — Prisma Migration (PostgreSQL)
+──────────────────────────────────────────────────────────────────────────────
+-- file: services/api/prisma/migrations/2025XXXX_moderation_and_safety/migration.sql
+-- Adds moderation/reporting/safety primitives.
+
+CREATE TYPE moderation_status AS ENUM ('OPEN','UNDER_REVIEW','ACTIONED','REJECTED');
+CREATE TYPE report_reason AS ENUM (
+  'SPAM','HARASSMENT','HATE','NUDITY','SCAM','PII','INAPPROPRIATE','OTHER'
+);
+CREATE TYPE content_kind AS ENUM ('POST','COMMENT','MESSAGE','PROFILE','JOB');
+
+CREATE TABLE "Report" (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  reporter_id UUID NOT NULL REFERENCES "User"(id) ON DELETE CASCADE,
+  content_kind content_kind NOT NULL,
+  content_id UUID NOT NULL,
+  reason report_reason NOT NULL,
+  details TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  status moderation_status NOT NULL DEFAULT 'OPEN'
+);
+
+CREATE TABLE "ModerationCase" (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  report_id UUID REFERENCES "Report"(id) ON DELETE SET NULL,
+  content_kind content_kind NOT NULL,
+  content_id UUID NOT NULL,
+  status moderation_status NOT NULL DEFAULT 'UNDER_REVIEW',
+  risk_score INTEGER NOT NULL DEFAULT 0,
+  labels TEXT[] NOT NULL DEFAULT '{}',
+  assigned_to UUID REFERENCES "User"(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE "ContentFlag" (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  content_kind content_kind NOT NULL,
+  content_id UUID NOT NULL,
+  flags TEXT[] NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE "Block" (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  blocker_id UUID NOT NULL REFERENCES "User"(id) ON DELETE CASCADE,
+  blocked_id UUID NOT NULL REFERENCES "User"(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(blocker_id, blocked_id)
+);
+
+CREATE TABLE "Mute" (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  muter_id UUID NOT NULL REFERENCES "User"(id) ON DELETE CASCADE,
+  muted_id UUID NOT NULL REFERENCES "User"(id) ON DELETE CASCADE,
+  expires_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(muter_id, muted_id)
+);
+
+CREATE TABLE "SafetyProfile" (
+  user_id UUID PRIMARY KEY REFERENCES "User"(id) ON DELETE CASCADE,
+  youth_mode BOOLEAN NOT NULL DEFAULT FALSE,
+  allow_dms_from_verified_only BOOLEAN NOT NULL DEFAULT FALSE,
+  safe_search BOOLEAN NOT NULL DEFAULT TRUE,
+  hide_in_search BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE "EmployerVerificationRequest" (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES "User"(id) ON DELETE CASCADE,
+  company_name TEXT NOT NULL,
+  company_domain TEXT,
+  proof_url TEXT,
+  status TEXT NOT NULL DEFAULT 'PENDING',
+  notes TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE "GuardianConsent" (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  youth_id UUID NOT NULL REFERENCES "User"(id) ON DELETE CASCADE,
+  guardian_email TEXT NOT NULL,
+  token TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'PENDING',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_report_content ON "Report"(content_kind, content_id);
+CREATE INDEX idx_modcase_content ON "ModerationCase"(content_kind, content_id);
+CREATE INDEX idx_block_blocker ON "Block"(blocker_id);
+CREATE INDEX idx_block_blocked ON "Block"(blocked_id);
+
+──────────────────────────────────────────────────────────────────────────────
+Backend — Common Types
+──────────────────────────────────────────────────────────────────────────────
+/* file: packages/shared/src/types/moderation.ts */
+export type ModerationStatus = 'OPEN' | 'UNDER_REVIEW' | 'ACTIONED' | 'REJECTED';
+export type ReportReason =
+  | 'SPAM' | 'HARASSMENT' | 'HATE' | 'NUDITY' | 'SCAM' | 'PII' | 'INAPPROPRIATE' | 'OTHER';
+export type ContentKind = 'POST' | 'COMMENT' | 'MESSAGE' | 'PROFILE' | 'JOB';
+
+export interface ReportDTO {
+  id: string;
+  reporterId: string;
+  contentKind: ContentKind;
+  contentId: string;
+  reason: ReportReason;
+  details?: string;
+  status: ModerationStatus;
+  createdAt: string;
+}
+
+export interface ModerationCaseDTO {
+  id: string;
+  reportId?: string;
+  contentKind: ContentKind;
+  contentId: string;
+  status: ModerationStatus;
+  riskScore: number;
+  labels: string[];
+  assignedTo?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/* file: packages/shared/src/types/safety.ts */
+export interface SafetyProfileDTO {
+  userId: string;
+  youthMode: boolean;
+  allowDMsFromVerifiedOnly: boolean;
+  safeSearch: boolean;
+  hideInSearch: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+──────────────────────────────────────────────────────────────────────────────
+Backend — Moderation Module
+──────────────────────────────────────────────────────────────────────────────
+/* file: services/api/src/modules/moderation/index.ts */
+export * from './service';
+export * from './controller';
+export * from './routes';
+
+/* file: services/api/src/modules/moderation/entities.ts */
+import { ContentKind, ModerationStatus, ReportReason } from '@lockedin/shared/types/moderation';
+
+export interface Report {
+  id: string;
+  reporterId: string;
+  contentKind: ContentKind;
+  contentId: string;
+  reason: ReportReason;
+  details?: string;
+  status: ModerationStatus;
+  createdAt: Date;
+}
+
+export interface ModerationCase {
+  id: string;
+  reportId?: string;
+  contentKind: ContentKind;
+  contentId: string;
+  status: ModerationStatus;
+  riskScore: number;
+  labels: string[];
+  assignedTo?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/* file: services/api/src/modules/moderation/policies.ts */
+export const BANNED_TERMS = [
+  'hate slur A', 'hate slur B', 'wire money to', 'crypto double your money',
+];
+export const RISK_LABELS = {
+  PII: 'PII_DETECTED',
+  EXTERNAL_CONTACT: 'EXTERNAL_CONTACT_INFO',
+  HATE: 'HATE_SPEECH',
+  SCAM: 'SCAM_SIGNALS',
+  NSFW: 'NSFW',
+};
+export const MAX_YOUTH_CONTACT_INFO = 0; // hard block: email/phone/addr in youth DMs
+
+/* file: services/api/src/modules/moderation/heuristics.ts */
+import { RISK_LABELS, BANNED_TERMS } from './policies';
+
+const EMAIL_RE = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
+const PHONE_RE = /\b(\+?\d{1,3}[-.\s]?)?(\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}\b/;
+const URL_RE = /\bhttps?:\/\/[^\s/$.?#].[^\s]*\b/i;
+
+export function analyzeText(text: string): { score: number; labels: string[] } {
+  let score = 0;
+  const labels: string[] = [];
+  if (EMAIL_RE.test(text) || PHONE_RE.test(text)) {
+    score += 30;
+    labels.push(RISK_LABELS.PII, RISK_LABELS.EXTERNAL_CONTACT);
+  }
+  if (URL_RE.test(text)) score += 10;
+  if (BANNED_TERMS.some(t => text.toLowerCase().includes(t.toLowerCase()))) {
+    score += 60;
+    labels.push(RISK_LABELS.HATE);
+  }
+  return { score: Math.min(100, score), labels: Array.from(new Set(labels)) };
+}
+
+/* file: services/api/src/modules/moderation/service.ts */
+import { PrismaClient } from '@prisma/client';
+import { analyzeText } from './heuristics';
+import type { Report } from './entities';
+import { ContentKind } from '@lockedin/shared/types/moderation';
+
+const prisma = new PrismaClient();
+
+export const ModerationService = {
+  async reportContent(input: {
+    reporterId: string;
+    contentKind: ContentKind;
+    contentId: string;
+    reason: string;
+    details?: string;
+  }) {
+    const report = await prisma.report.create({
+      data: {
+        reporter_id: input.reporterId,
+        content_kind: input.contentKind as any,
+        content_id: input.contentId,
+        reason: input.reason as any,
+        details: input.details ?? null,
+      }
+    });
+    await prisma.moderationCase.create({
+      data: {
+        report_id: report.id,
+        content_kind: input.contentKind as any,
+        content_id: input.contentId,
+        status: 'UNDER_REVIEW',
+        risk_score: 0,
+        labels: [],
+      }
+    });
+    return report;
+  },
+
+  async openCaseForContent(contentKind: ContentKind, contentId: string, plainText: string) {
+    const { score, labels } = analyzeText(plainText);
+    return prisma.moderationCase.create({
+      data: {
+        content_kind: contentKind as any,
+        content_id: contentId,
+        status: 'UNDER_REVIEW',
+        risk_score: score,
+        labels,
+      }
+    });
+  },
+
+  async actionCase(caseId: string, action: 'REMOVE'|'LIMIT'|'NO_ACTION', notes?: string) {
+    const mc = await prisma.moderationCase.update({
+      where: { id: caseId },
+      data: { status: action === 'NO_ACTION' ? 'REJECTED' : 'ACTIONED' }
+    });
+    await prisma.auditLog.create({
+      data: { category: 'MODERATION', actor: 'system/admin', subject: caseId, metadata: { action, notes } as any }
+    });
+    return mc;
+  },
+
+  async listCases(params: { status?: string; cursor?: string; limit?: number }) {
+    const take = Math.min(100, params.limit ?? 25);
+    return prisma.moderationCase.findMany({
+      where: params.status ? { status: params.status as any } : {},
+      take, skip: params.cursor ? 1 : 0,
+      ...(params.cursor ? { cursor: { id: params.cursor } } : {}),
+      orderBy: { created_at: 'desc' }
+    });
+  }
+};
+
+/* file: services/api/src/modules/moderation/controller.ts */
+import { Request, Response } from 'express';
+import { ModerationService } from './service';
+
+export const ModerationController = {
+  report: async (req: Request, res: Response) => {
+    const body = req.body;
+    const report = await ModerationService.reportContent({
+      reporterId: req.user!.id, // assumes auth middleware sets req.user
+      contentKind: body.contentKind,
+      contentId: body.contentId,
+      reason: body.reason,
+      details: body.details
+    });
+    res.status(201).json(report);
+  },
+
+  listCases: async (req: Request, res: Response) => {
+    const out = await ModerationService.listCases({
+      status: req.query.status as string | undefined,
+      cursor: req.query.cursor as string | undefined,
+      limit: req.query.limit ? parseInt(req.query.limit as string, 10) : undefined
+    });
+    res.json(out);
+  },
+
+  action: async (req: Request, res: Response) => {
+    const out = await ModerationService.actionCase(req.params.id, req.body.action, req.body.notes);
+    res.json(out);
+  }
+};
+
+/* file: services/api/src/modules/moderation/routes.ts */
+import { Router } from 'express';
+import { ModerationController } from './controller';
+import { requireAdmin, requireAuth } from '../../common/authz';
+
+const r = Router();
+r.post('/reports', requireAuth, ModerationController.report);
+r.get('/moderation/cases', requireAdmin, ModerationController.listCases);
+r.patch('/moderation/cases/:id', requireAdmin, ModerationController.action);
+export default r;
+
+──────────────────────────────────────────────────────────────────────────────
+Backend — Reports Module
+──────────────────────────────────────────────────────────────────────────────
+/* file: services/api/src/modules/reports/service.ts */
+import { PrismaClient } from '@prisma/client';
+const prisma = new PrismaClient();
+
+export const ReportsService = {
+  async myReports(userId: string) {
+    return prisma.report.findMany({
+      where: { reporter_id: userId },
+      orderBy: { created_at: 'desc' }
+    });
+  }
+};
+
+/* file: services/api/src/modules/reports/controller.ts */
+import { Request, Response } from 'express';
+import { ReportsService } from './service';
+export const ReportsController = {
+  mine: async (req: Request, res: Response) => {
+    const rows = await ReportsService.myReports(req.user!.id);
+    res.json(rows);
+  }
+};
+
+/* file: services/api/src/modules/reports/routes.ts */
+import { Router } from 'express';
+import { ReportsController } from './controller';
+import { requireAuth } from '../../common/authz';
+const r = Router();
+r.get('/me/reports', requireAuth, ReportsController.mine);
+export default r;
+
+──────────────────────────────────────────────────────────────────────────────
+Backend — Safety Module (youth safeguards, blocks, verification)
+──────────────────────────────────────────────────────────────────────────────
+/* file: services/api/src/modules/safety/middlewares.ts */
+import { Request, Response, NextFunction } from 'express';
+import { PrismaClient } from '@prisma/client';
+const prisma = new PrismaClient();
+
+export async function enforceYouthDMPolicy(req: Request, res: Response, next: NextFunction) {
+  const sender = req.user!;
+  const { recipientId, text } = req.body;
+  const [recipientSafety, recipient] = await Promise.all([
+    prisma.safetyProfile.findUnique({ where: { user_id: recipientId } }),
+    prisma.user.findUnique({ where: { id: recipientId } })
+  ]);
+  if (recipientSafety?.youth_mode) {
+    // Youth: allow DMs only from verified employers OR friended accounts (depending on your social model)
+    const senderIsVerifiedEmployer = Boolean(sender.employer_verified);
+    if (!senderIsVerifiedEmployer) {
+      return res.status(403).json({ error: 'Youth DMs only allowed from verified employers.' });
+    }
+  }
+  next();
+}
+
+/* file: services/api/src/modules/safety/service.ts */
+import { PrismaClient } from '@prisma/client';
+const prisma = new PrismaClient();
+
+export const SafetyService = {
+  async getProfile(userId: string) {
+    return prisma.safetyProfile.upsert({
+      where: { user_id: userId },
+      create: { user_id: userId },
+      update: {}
+    });
+  },
+  async updateProfile(userId: string, patch: Partial<{
+    youth_mode: boolean;
+    allow_dms_from_verified_only: boolean;
+    safe_search: boolean;
+    hide_in_search: boolean;
+  }>) {
+    return prisma.safetyProfile.update({
+      where: { user_id: userId },
+      data: patch as any
+    });
+  },
+  async block(userId: string, targetId: string) {
+    return prisma.block.upsert({
+      where: { blocker_id_blocked_id: { blocker_id: userId, blocked_id: targetId } },
+      create: { blocker_id: userId, blocked_id: targetId },
+      update: {}
+    });
+  },
+  async unblock(userId: string, targetId: string) {
+    return prisma.block.delete({
+      where: { blocker_id_blocked_id: { blocker_id: userId, blocked_id: targetId } }
+    });
+  },
+  async listBlocked(userId: string) {
+    return prisma.block.findMany({ where: { blocker_id: userId }, orderBy: { created_at: 'desc' } });
+  },
+};
+
+/* file: services/api/src/modules/safety/employerVerification.ts */
+import { PrismaClient } from '@prisma/client';
+const prisma = new PrismaClient();
+
+export const EmployerVerification = {
+  async request(userId: string, input: { companyName: string; companyDomain?: string; proofUrl?: string; }) {
+    return prisma.employerVerificationRequest.create({
+      data: {
+        user_id: userId,
+        company_name: input.companyName,
+        company_domain: input.companyDomain ?? null,
+        proof_url: input.proofUrl ?? null
+      }
+    });
+  },
+  async review(id: string, status: 'APPROVED'|'REJECTED', notes?: string) {
+    const row = await prisma.employerVerificationRequest.update({
+      where: { id },
+      data: { status, notes: notes ?? null }
+    });
+    if (status === 'APPROVED') {
+      await prisma.user.update({ where: { id: row.user_id }, data: { employer_verified: true } as any });
+    }
+    return row;
+  }
+};
+
+/* file: services/api/src/modules/safety/controller.ts */
+import { Request, Response } from 'express';
+import { SafetyService } from './service';
+import { EmployerVerification } from './employerVerification';
+
+export const SafetyController = {
+  me: async (req: Request, res: Response) => {
+    const profile = await SafetyService.getProfile(req.user!.id);
+    res.json(profile);
+  },
+  patch: async (req: Request, res: Response) => {
+    const profile = await SafetyService.updateProfile(req.user!.id, req.body);
+    res.json(profile);
+  },
+  block: async (req: Request, res: Response) => {
+    await SafetyService.block(req.user!.id, req.body.targetId);
+    res.status(204).end();
+  },
+  unblock: async (req: Request, res: Response) => {
+    await SafetyService.unblock(req.user!.id, req.body.targetId);
+    res.status(204).end();
+  },
+  blocked: async (req: Request, res: Response) => {
+    const rows = await SafetyService.listBlocked(req.user!.id);
+    res.json(rows);
+  },
+  requestVerification: async (req: Request, res: Response) => {
+    const row = await EmployerVerification.request(req.user!.id, req.body);
+    res.status(201).json(row);
+  },
+};
+
+/* file: services/api/src/modules/safety/routes.ts */
+import { Router } from 'express';
+import { SafetyController } from './controller';
+import { requireAuth, requireAdmin } from '../../common/authz';
+
+const r = Router();
+r.get('/safety/me', requireAuth, SafetyController.me);
+r.patch('/safety/me', requireAuth, SafetyController.patch);
+r.get('/safety/blocked', requireAuth, SafetyController.blocked);
+r.post('/safety/block', requireAuth, SafetyController.block);
+r.post('/safety/unblock', requireAuth, SafetyController.unblock);
+r.post('/verification/employer', requireAuth, SafetyController.requestVerification);
+
+// Admin would have additional verification review endpoints (not shown for brevity)
+
+export default r;
+
+──────────────────────────────────────────────────────────────────────────────
+Frontend — Safety Center & Reporting UI (React + Tailwind + shadcn/ui)
+──────────────────────────────────────────────────────────────────────────────
+/* file: apps/web/src/features/safety/SafetyCenter.tsx */
+import React, { useEffect, useState } from 'react';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Switch } from '@/components/ui/switch';
+import { Badge } from '@/components/ui/badge';
+import { ShieldCheckIcon, BanIcon, UserXIcon, CheckCircleIcon } from 'lucide-react';
+import { api } from '@/lib/api';
+
+export default function SafetyCenter() {
+  const [profile, setProfile] = useState<any>(null);
+  const [blocked, setBlocked] = useState<any[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  const load = async () => {
+    const [p, b] = await Promise.all([api.get('/safety/me'), api.get('/safety/blocked')]);
+    setProfile(p.data); setBlocked(b.data);
+  };
+  useEffect(() => { load(); }, []);
+
+  const save = async (patch: any) => {
+    setBusy(true);
+    try {
+      const { data } = await api.patch('/safety/me', patch);
+      setProfile(data);
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div className="max-w-5xl mx-auto p-6 space-y-6">
+      <Card className="bg-white/90 border border-gray-200/60">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <ShieldCheckIcon className="w-5 h-5 text-emerald-600" />
+            Safety & Privacy
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="font-medium">Youth Mode</p>
+              <p className="text-sm text-gray-600">Stricter privacy & contact limits.</p>
+            </div>
+            <Switch checked={profile?.youth_mode} onCheckedChange={(v) => save({ youth_mode: v })} disabled={busy} />
+          </div>
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="font-medium">Allow DMs from verified employers only</p>
+              <p className="text-sm text-gray-600">Block strangers from messaging you.</p>
+            </div>
+            <Switch checked={profile?.allow_dms_from_verified_only} onCheckedChange={(v) => save({ allow_dms_from_verified_only: v })} disabled={busy} />
+          </div>
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="font-medium">Safe Search</p>
+              <p className="text-sm text-gray-600">Hide sensitive content in feeds and search.</p>
+            </div>
+            <Switch checked={profile?.safe_search} onCheckedChange={(v) => save({ safe_search: v })} disabled={busy} />
+          </div>
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="font-medium">Hide my profile from search</p>
+              <p className="text-sm text-gray-600">Your profile won’t appear in platform search.</p>
+            </div>
+            <Switch checked={profile?.hide_in_search} onCheckedChange={(v) => save({ hide_in_search: v })} disabled={busy} />
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="bg-white/90 border border-gray-200/60">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <UserXIcon className="w-5 h-5 text-rose-600" />
+            Blocked Accounts
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          {blocked.length === 0 ? (
+            <p className="text-gray-500">You haven’t blocked anyone.</p>
+          ) : (
+            <ul className="space-y-3">
+              {blocked.map(b => (
+                <li key={b.id} className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="w-8 h-8 rounded-full bg-gray-200" />
+                    <div>
+                      <div className="font-medium">User {b.blocked_id.slice(0,6)}…</div>
+                      <div className="text-xs text-gray-500">Blocked on {new Date(b.created_at).toLocaleDateString()}</div>
+                    </div>
+                  </div>
+                  <Button variant="outline" size="sm" onClick={async () => { await api.post('/safety/unblock', { targetId: b.blocked_id }); load(); }}>
+                    Unblock
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card className="bg-white/90 border border-gray-200/60">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <CheckCircleIcon className="w-5 h-5 text-indigo-600" />
+            Employer Verification
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <p className="text-sm text-gray-600 mb-3">Request a verified employer checkmark to contact youth users and post jobs faster.</p>
+          <VerificationRequestForm />
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function VerificationRequestForm() {
+  const [companyName, setCompanyName] = React.useState('');
+  const [companyDomain, setCompanyDomain] = React.useState('');
+  const [proofUrl, setProofUrl] = React.useState('');
+  const [sent, setSent] = React.useState(false);
+
+  const submit = async () => {
+    await api.post('/verification/employer', { companyName, companyDomain, proofUrl });
+    setSent(true);
+  };
+  if (sent) return <div className="text-emerald-700 text-sm">Request submitted. We’ll email you after review.</div>;
+
+  return (
+    <div className="grid gap-3 md:grid-cols-3">
+      <input className="border rounded-md p-2" placeholder="Company Name" value={companyName} onChange={e=>setCompanyName(e.target.value)} />
+      <input className="border rounded-md p-2" placeholder="Company Domain (optional)" value={companyDomain} onChange={e=>setCompanyDomain(e.target.value)} />
+      <input className="border rounded-md p-2" placeholder="Proof URL (optional)" value={proofUrl} onChange={e=>setProofUrl(e.target.value)} />
+      <div className="md:col-span-3">
+        <Button onClick={submit}>Submit Verification</Button>
+      </div>
+    </div>
+  );
+}
+
+──────────────────────────────────────────────────────────────────────────────
+Frontend — Report Dialog & Integrations
+──────────────────────────────────────────────────────────────────────────────
+/* file: apps/web/src/features/safety/ReportDialog.tsx */
+import React, { useState } from 'react';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Button } from '@/components/ui/button';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Textarea } from '@/components/ui/textarea';
+import { api } from '@/lib/api';
+
+export function ReportDialog({ open, onOpenChange, contentKind, contentId }: any) {
+  const [reason, setReason] = useState<string>('SPAM');
+  const [details, setDetails] = useState<string>('');
+
+  const submit = async () => {
+    await api.post('/reports', { contentKind, contentId, reason, details });
+    onOpenChange(false);
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader><DialogTitle>Report content</DialogTitle></DialogHeader>
+        <div className="space-y-3">
+          <Select value={reason} onValueChange={setReason}>
+            <SelectTrigger><SelectValue placeholder="Reason" /></SelectTrigger>
+            <SelectContent>
+              {['SPAM','HARASSMENT','HATE','NUDITY','SCAM','PII','INAPPROPRIATE','OTHER'].map(r=>(
+                <SelectItem key={r} value={r}>{r}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Textarea value={details} onChange={e=>setDetails(e.target.value)} placeholder="Optional details…" />
+          <Button onClick={submit} className="w-full">Submit Report</Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/* file: apps/web/src/features/social/components/withReportable.tsx */
+import React from 'react';
+import { MoreVertical } from 'lucide-react';
+import { ReportDialog } from '@/features/safety/ReportDialog';
+
+export function withReportable<T extends { id: string }>(
+  Component: React.ComponentType<any>,
+  contentKind: 'POST'|'COMMENT'|'MESSAGE'|'PROFILE'|'JOB'
+) {
+  return function Reportable(props: any) {
+    const [open, setOpen] = React.useState(false);
+    return (
+      <div className="relative group">
+        <Component {...props} />
+        <button
+          className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 bg-white/90 border rounded-md p-1"
+          onClick={() => setOpen(true)}
+          aria-label="Report"
+        >
+          <MoreVertical className="w-4 h-4" />
+        </button>
+        <ReportDialog open={open} onOpenChange={setOpen} contentKind={contentKind} contentId={props.id} />
+      </div>
+    );
+  };
+}
+
+──────────────────────────────────────────────────────────────────────────────
+Frontend — Admin Moderation Console (MVP)
+──────────────────────────────────────────────────────────────────────────────
+/* file: apps/web/src/features/safety/ModerationConsole.tsx */
+import React, { useEffect, useState } from 'react';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { api } from '@/lib/api';
+
+export default function ModerationConsole() {
+  const [rows, setRows] = useState<any[]>([]);
+  const load = async () => {
+    const { data } = await api.get('/moderation/cases?limit=50');
+    setRows(data);
+  };
+  useEffect(() => { load(); }, []);
+
+  const action = async (id: string, a: string) => {
+    await api.patch(`/moderation/cases/${id}`, { action: a });
+    await load();
+  };
+
+  return (
+    <div className="max-w-6xl mx-auto p-6">
+      <Card className="bg-white/90 border">
+        <CardHeader><CardTitle>Moderation Queue</CardTitle></CardHeader>
+        <CardContent>
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-gray-500">
+                <th className="py-2">ID</th><th>Kind</th><th>Risk</th><th>Labels</th><th>Status</th><th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map(r => (
+                <tr key={r.id} className="border-t">
+                  <td className="py-2">{r.id.slice(0,8)}…</td>
+                  <td>{r.content_kind}</td>
+                  <td><Badge>{r.risk_score}</Badge></td>
+                  <td className="space-x-1">{(r.labels||[]).map((l:string)=><Badge key={l} variant="outline">{l}</Badge>)}</td>
+                  <td>{r.status}</td>
+                  <td className="space-x-2">
+                    <Button size="sm" variant="outline" onClick={()=>action(r.id,'REMOVE')}>Remove</Button>
+                    <Button size="sm" variant="outline" onClick={()=>action(r.id,'LIMIT')}>Limit</Button>
+                    <Button size="sm" variant="ghost" onClick={()=>action(r.id,'NO_ACTION')}>No action</Button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+──────────────────────────────────────────────────────────────────────────────
+Messaging Integration Hooks (server-side policy check)
+──────────────────────────────────────────────────────────────────────────────
+/* file: services/api/src/modules/messaging/hooks/policy.ts */
+import type { Request, Response, NextFunction } from 'express';
+import { enforceYouthDMPolicy } from '../../safety/middlewares';
+
+// Example: in your messaging send route, add enforceYouthDMPolicy before controller
+// router.post('/messages', requireAuth, enforceYouthDMPolicy, MessagesController.send);
+
+──────────────────────────────────────────────────────────────────────────────
+Seeding Default Safety Policies
+──────────────────────────────────────────────────────────────────────────────
+/* file: scripts/seed/seed_safety_policies.ts */
+import { PrismaClient } from '@prisma/client';
+const prisma = new PrismaClient();
+async function main() {
+  const users = await prisma.user.findMany({ take: 5 }); // demo
+  for (const u of users) {
+    await prisma.safetyProfile.upsert({
+      where: { user_id: u.id },
+      create: { user_id: u.id, youth_mode: false, allow_dms_from_verified_only: false, safe_search: true, hide_in_search: false },
+      update: {}
+    });
+  }
+  console.log('Seeded safety profiles.');
+}
+main().finally(()=>prisma.$disconnect());
+
+──────────────────────────────────────────────────────────────────────────────
+API Wiring
+──────────────────────────────────────────────────────────────────────────────
+/* file: services/api/src/server.ts (snippet to mount routes) */
+import moderationRoutes from './modules/moderation/routes';
+import reportsRoutes from './modules/reports/routes';
+import safetyRoutes from './modules/safety/routes';
+
+app.use('/api', moderationRoutes);
+app.use('/api', reportsRoutes);
+app.use('/api', safetyRoutes);
+
+──────────────────────────────────────────────────────────────────────────────
+Notes & Next Steps
+──────────────────────────────────────────────────────────────────────────────
+1) Wire `enforceYouthDMPolicy` into messaging send/create endpoints.
+2) Optionally gate job postings targeting minors: refuse non-verified employers, require pay visibility, forbid in-person interview language for youth roles.
+3) Add email flows for GuardianConsent (tokenized link, approve/deny).
+4) Extend heuristics with ML providers; keep env placeholders only (no keys in code).
+5) Log decisions to `AuditLog` for compliance exports.
+6) Add SAFE-SEARCH feed filtering using labels from `ContentFlag` and heuristics.
+

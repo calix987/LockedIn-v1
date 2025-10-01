@@ -1,0 +1,938 @@
+# LockedIn — Bundle 01 (Auth + Accounts)
+# Monorepo additions for authentication, youth safety, sessions, users API, and basic web flows.
+# Split this file by the '----- /path/from/repo/root -----' separators into real files.
+
+----- /apps/api/.env.example -----
+# Copy to .env and adjust. No secrets committed.
+# Postgres
+DATABASE_URL=postgresql://lockedin:lockedin@localhost:5432/lockedin
+# JWT
+JWT_SECRET=change_me_dev_secret_only
+JWT_EXPIRES_IN=15m
+REFRESH_EXPIRES_DAYS=30
+# CORS (comma-separated origins)
+CORS_ORIGINS=http://localhost:5173,http://localhost:3000
+# App
+APP_PORT=4000
+NODE_ENV=development
+
+----- /apps/api/package.json -----
+{
+  "name": "@lockedin/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/main.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:deploy": "prisma migrate deploy",
+    "seed": "ts-node src/prisma/seed.ts"
+  },
+  "dependencies": {
+    "@nestjs/common": "^10.0.0",
+    "@nestjs/config": "^3.2.2",
+    "@nestjs/core": "^10.0.0",
+    "@nestjs/jwt": "^10.2.0",
+    "@nestjs/platform-express": "^10.0.0",
+    "@prisma/client": "^5.15.0",
+    "argon2": "^0.31.2",
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "nanoid": "^5.0.7",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/cookie-parser": "^1.4.6",
+    "@types/express": "^4.17.21",
+    "@types/jsonwebtoken": "^9.0.6",
+    "prisma": "^5.15.0",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.4.5"
+  }
+}
+
+----- /apps/api/tsconfig.json -----
+{
+  "compilerOptions": {
+    "module": "ES2022",
+    "target": "ES2022",
+    "moduleResolution": "Node",
+    "outDir": "dist",
+    "rootDir": ".",
+    "baseUrl": ".",
+    "strict": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "sourceMap": true
+  },
+  "include": ["src", "src/**/*.ts"]
+}
+
+----- /apps/api/prisma/schema.prisma -----
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AgeMode {
+  YOUTH
+  ADULT
+}
+
+model User {
+  id                 String   @id @default(cuid())
+  email              String   @unique
+  emailVerifiedAt    DateTime?
+  passwordHash       String?
+  fullName           String?
+  headline           String?
+  dob                DateTime?
+  ageMode            AgeMode  @default(ADULT)
+  guardianEmail      String?
+  guardianVerifiedAt DateTime?
+
+  country            String?
+  city               String?
+  availabilityHours  Int?
+  targetSalary       Int?
+  skills             String[]
+  portfolioLinks     String[]
+
+  isEmployer         Boolean  @default(false)
+  isVerifiedEmployer Boolean  @default(false)
+
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  sessions           Session[]
+  accounts           Account[]
+  verificationTokens VerificationToken[]
+}
+
+model Account {
+  id                String   @id @default(cuid())
+  userId            String
+  provider          String
+  providerAccountId String
+  accessToken       String?
+  refreshToken      String?
+  expiresAt         DateTime?
+
+  user              User     @relation(fields: [userId], references: [id])
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id               String   @id @default(cuid())
+  userId           String
+  refreshTokenHash String
+  userAgent        String?
+  ip               String?
+  expiresAt        DateTime
+  createdAt        DateTime @default(now())
+
+  user             User     @relation(fields: [userId], references: [id])
+}
+
+model VerificationToken {
+  id          String   @id @default(cuid())
+  userId      String
+  type        String   // "email_verification" | "guardian_consent"
+  token       String   @unique
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+  consumedAt  DateTime?
+
+  user        User     @relation(fields: [userId], references: [id])
+}
+
+model Organization {
+  id          String   @id @default(cuid())
+  name        String
+  verified    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+----- /apps/api/src/main.ts -----
+import 'dotenv/config';
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module.js';
+import * as cookieParser from 'cookie-parser';
+import helmet from 'helmet';
+import cors from 'cors';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  app.use(helmet());
+  const origins = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+  app.use(cors({
+    origin: origins.length ? origins : true,
+    credentials: true,
+  }));
+  app.use(cookieParser());
+  await app.listen(process.env.APP_PORT || 4000);
+  console.log(`API listening on :${process.env.APP_PORT || 4000}`);
+}
+bootstrap();
+
+----- /apps/api/src/app.module.ts -----
+import { Module } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
+import { PrismaService } from './common/prisma.service.js';
+import { AuthModule } from './auth/auth.module.js';
+import { UsersModule } from './users/users.module.js';
+
+@Module({
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true }),
+    AuthModule,
+    UsersModule,
+  ],
+  providers: [PrismaService],
+})
+export class AppModule {}
+
+----- /apps/api/src/common/prisma.service.ts -----
+import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { PrismaClient } from '@prisma/client';
+
+@Injectable()
+export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
+  async onModuleInit() {
+    await this.$connect();
+  }
+  async onModuleDestroy() {
+    await this.$disconnect();
+  }
+}
+
+----- /apps/api/src/auth/dto/register.dto.ts -----
+import { z } from 'zod';
+
+export const registerSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8),
+  fullName: z.string().min(2).max(100),
+  dob: z.string().optional(), // ISO date
+  guardianEmail: z.string().email().optional(),
+});
+
+export type RegisterDto = z.infer<typeof registerSchema>;
+
+----- /apps/api/src/auth/dto/login.dto.ts -----
+import { z } from 'zod';
+
+export const loginSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8),
+});
+
+export type LoginDto = z.infer<typeof loginSchema>;
+
+----- /apps/api/src/auth/dto/refresh.dto.ts -----
+import { z } from 'zod';
+
+export const refreshSchema = z.object({
+  refreshToken: z.string().min(16),
+});
+
+export type RefreshDto = z.infer<typeof refreshSchema>;
+
+----- /apps/api/src/auth/dto/verify.dto.ts -----
+import { z } from 'zod';
+
+export const tokenSchema = z.object({
+  token: z.string().min(10),
+});
+
+export type TokenDto = z.infer<typeof tokenSchema>;
+
+----- /apps/api/src/auth/entities/tokens.ts -----
+export type JwtPayload = {
+  sub: string;
+  email: string;
+  ageMode: 'YOUTH' | 'ADULT';
+};
+
+export type TokenPair = { accessToken: string; refreshToken: string };
+
+----- /apps/api/src/auth/auth.module.ts -----
+import { Module } from '@nestjs/common';
+import { JwtModule } from '@nestjs/jwt';
+import { AuthService } from './auth.service.js';
+import { AuthController } from './auth.controller.js';
+import { PrismaService } from '../common/prisma.service.js';
+
+@Module({
+  imports: [
+    JwtModule.register({
+      secret: process.env.JWT_SECRET || 'dev_secret',
+      signOptions: { expiresIn: process.env.JWT_EXPIRES_IN || '15m' },
+    }),
+  ],
+  controllers: [AuthController],
+  providers: [AuthService, PrismaService],
+  exports: [AuthService],
+})
+export class AuthModule {}
+
+----- /apps/api/src/auth/auth.service.ts -----
+import { Injectable, BadRequestException, UnauthorizedException } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import { PrismaService } from '../common/prisma.service.js';
+import { registerSchema, RegisterDto } from './dto/register.dto.js';
+import { loginSchema, LoginDto } from './dto/login.dto.js';
+import { refreshSchema } from './dto/refresh.dto.js';
+import type { JwtPayload, TokenPair } from './entities/tokens.js';
+import { nanoid } from 'nanoid';
+import * as bcrypt from 'bcryptjs';
+import crypto from 'node:crypto';
+
+const REFRESH_DAYS = parseInt(process.env.REFRESH_EXPIRES_DAYS || '30', 10);
+
+function calcAge(dobISO?: string) {
+  if (!dobISO) return null;
+  const dob = new Date(dobISO);
+  const diff = Date.now() - dob.getTime();
+  const ageDate = new Date(diff);
+  return Math.abs(ageDate.getUTCFullYear() - 1970);
+}
+
+@Injectable()
+export class AuthService {
+  constructor(private jwt: JwtService, private prisma: PrismaService) {}
+
+  async register(input: RegisterDto) {
+    const data = registerSchema.parse(input);
+    const existing = await this.prisma.user.findUnique({ where: { email: data.email } });
+    if (existing) throw new BadRequestException('Email already in use');
+
+    const passwordHash = await bcrypt.hash(data.password, 12);
+    const age = calcAge(data.dob);
+    const ageMode = age !== null && age < 18 ? 'YOUTH' : 'ADULT';
+
+    // If under 16, guardian email required
+    if (age !== null && age < 16 && !data.guardianEmail) {
+      throw new BadRequestException('Guardian email required for users under 16');
+    }
+
+    const user = await this.prisma.user.create({
+      data: {
+        email: data.email.toLowerCase(),
+        passwordHash,
+        fullName: data.fullName,
+        dob: data.dob ? new Date(data.dob) : undefined,
+        ageMode,
+        guardianEmail: data.guardianEmail,
+      },
+    });
+
+    // Create email verification token
+    await this.issueVerificationToken(user.id, 'email_verification');
+
+    // If guardian required, create guardian token too
+    if (age !== null && age < 16 && data.guardianEmail) {
+      await this.issueVerificationToken(user.id, 'guardian_consent', data.guardianEmail);
+    }
+
+    return { status: 'registered', verifyEmailSent: true, guardianRequired: age !== null && age < 16 };
+  }
+
+  async login(input: LoginDto): Promise<{ tokens: TokenPair }> {
+    const data = loginSchema.parse(input);
+    const user = await this.prisma.user.findUnique({ where: { email: data.email.toLowerCase() } });
+    if (!user || !user.passwordHash || !(await bcrypt.compare(data.password, user.passwordHash))) {
+      throw new UnauthorizedException('Invalid credentials');
+    }
+
+    // Youth safety: require guardian consent for under 16
+    if (user.ageMode === 'YOUTH' && user.dob) {
+      const nowAge = calcAge(user.dob.toISOString());
+      if (nowAge !== null && nowAge < 16 && !user.guardianVerifiedAt) {
+        throw new UnauthorizedException('Guardian consent required');
+      }
+    }
+
+    const tokens = await this.issueTokens(user.id, user.email, user.ageMode);
+    return { tokens };
+  }
+
+  async refresh(refreshToken: string): Promise<TokenPair> {
+    refreshSchema.parse({ refreshToken });
+    const tokenHash = this.hashToken(refreshToken);
+    const session = await this.prisma.session.findFirst({
+      where: { refreshTokenHash: tokenHash, expiresAt: { gt: new Date() } },
+      include: { user: true },
+    });
+    if (!session) throw new UnauthorizedException('Invalid session');
+
+    return this.issueTokens(session.user.id, session.user.email, session.user.ageMode);
+  }
+
+  async logout(refreshToken: string) {
+    const tokenHash = this.hashToken(refreshToken);
+    await this.prisma.session.deleteMany({ where: { refreshTokenHash: tokenHash } });
+    return { ok: true };
+  }
+
+  async verifyEmail(token: string) {
+    const vt = await this.consumeToken(token, 'email_verification');
+    await this.prisma.user.update({ where: { id: vt.userId }, data: { emailVerifiedAt: new Date() } });
+    return { verified: true };
+  }
+
+  async guardianApprove(token: string) {
+    const vt = await this.consumeToken(token, 'guardian_consent');
+    const user = await this.prisma.user.update({ where: { id: vt.userId }, data: { guardianVerifiedAt: new Date() } });
+    return { approved: true, userId: user.id };
+  }
+
+  // Helpers
+  private async issueTokens(userId: string, email: string, ageMode: 'YOUTH' | 'ADULT'): Promise<TokenPair> {
+    const payload: JwtPayload = { sub: userId, email, ageMode };
+    const accessToken = await this.jwt.signAsync(payload);
+    const refreshToken = nanoid(64);
+    const refreshTokenHash = this.hashToken(refreshToken);
+    const expiresAt = new Date(Date.now() + REFRESH_DAYS * 24 * 60 * 60 * 1000);
+    await this.prisma.session.create({
+      data: { userId, refreshTokenHash, expiresAt },
+    });
+    return { accessToken, refreshToken };
+  }
+
+  private hashToken(token: string) {
+    return crypto.createHash('sha256').update(token).digest('hex');
+  }
+
+  private async issueVerificationToken(userId: string, type: 'email_verification' | 'guardian_consent', sendToEmail?: string) {
+    const token = nanoid(48);
+    const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24); // 24h
+    await this.prisma.verificationToken.create({
+      data: { userId, type, token, expiresAt },
+    });
+    // Dev mailer: log the link so you can click it in dev
+    const base = process.env.DEV_PUBLIC_WEB || 'http://localhost:5173';
+    const path = type === 'email_verification' ? '/auth/verify-email' : '/auth/guardian-approve';
+    console.log(`[DEV-MAILER] ${type} for user ${userId} → ${base}${path}?token=${token}`);
+    if (sendToEmail) {
+      console.log(`[DEV-MAILER] Would send to guardian ${sendToEmail}`);
+    }
+  }
+
+  private async consumeToken(token: string, type: 'email_verification' | 'guardian_consent') {
+    const vt = await this.prisma.verificationToken.findUnique({ where: { token } });
+    if (!vt || vt.type !== type || vt.consumedAt || vt.expiresAt < new Date()) {
+      throw new BadRequestException('Invalid or expired token');
+    }
+    await this.prisma.verificationToken.update({ where: { id: vt.id }, data: { consumedAt: new Date() } });
+    return vt;
+  }
+}
+
+----- /apps/api/src/auth/auth.controller.ts -----
+import { Body, Controller, Post } from '@nestjs/common';
+import { AuthService } from './auth.service.js';
+import { registerSchema } from './dto/register.dto.js';
+import { loginSchema } from './dto/login.dto.js';
+import { refreshSchema } from './dto/refresh.dto.js';
+import { tokenSchema } from './dto/verify.dto.js';
+
+@Controller('/auth')
+export class AuthController {
+  constructor(private auth: AuthService) {}
+
+  @Post('/register')
+  async register(@Body() body: unknown) {
+    const data = registerSchema.parse(body);
+    return this.auth.register(data);
+  }
+
+  @Post('/login')
+  async login(@Body() body: unknown) {
+    const data = loginSchema.parse(body);
+    return this.auth.login(data);
+  }
+
+  @Post('/refresh')
+  async refresh(@Body() body: unknown) {
+    const data = refreshSchema.parse(body);
+    return this.auth.refresh(data.refreshToken);
+  }
+
+  @Post('/logout')
+  async logout(@Body() body: unknown) {
+    const data = refreshSchema.parse(body);
+    return this.auth.logout(data.refreshToken);
+  }
+
+  @Post('/verify-email')
+  async verifyEmail(@Body() body: unknown) {
+    const data = tokenSchema.parse(body);
+    return this.auth.verifyEmail(data.token);
+  }
+
+  @Post('/guardian/approve')
+  async guardianApprove(@Body() body: unknown) {
+    const data = tokenSchema.parse(body);
+    return this.auth.guardianApprove(data.token);
+  }
+}
+
+----- /apps/api/src/users/users.module.ts -----
+import { Module } from '@nestjs/common';
+import { UsersService } from './users.service.js';
+import { UsersController } from './users.controller.js';
+import { PrismaService } from '../common/prisma.service.js';
+
+@Module({
+  providers: [UsersService, PrismaService],
+  controllers: [UsersController],
+  exports: [UsersService],
+})
+export class UsersModule {}
+
+----- /apps/api/src/users/users.service.ts -----
+import { Injectable, NotFoundException } from '@nestjs/common';
+import { PrismaService } from '../common/prisma.service.js';
+
+@Injectable()
+export class UsersService {
+  constructor(private prisma: PrismaService) {}
+
+  async me(userId: string) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw new NotFoundException('User not found');
+    // strip sensitive fields
+    const { passwordHash, ...safe } = user;
+    return safe;
+  }
+}
+
+----- /apps/api/src/users/users.controller.ts -----
+import { Controller, Get, Headers } from '@nestjs/common';
+import jwt from 'jsonwebtoken';
+import { UsersService } from './users.service.js';
+
+@Controller('/users')
+export class UsersController {
+  constructor(private users: UsersService) {}
+
+  @Get('/me')
+  async me(@Headers('authorization') authHeader?: string) {
+    if (!authHeader) {
+      return { anonymous: true };
+    }
+    const token = authHeader.replace(/^Bearer\s+/i, '');
+    const payload = jwt.verify(token, process.env.JWT_SECRET || 'dev_secret') as any;
+    return this.users.me(payload.sub);
+  }
+}
+
+----- /apps/api/src/prisma/seed.ts -----
+import 'dotenv/config';
+import { PrismaClient } from '@prisma/client';
+import * as bcrypt from 'bcryptjs';
+
+const prisma = new PrismaClient();
+
+async function main() {
+  const email = 'demo@lockedin.app';
+  const existing = await prisma.user.findUnique({ where: { email } });
+  if (!existing) {
+    const passwordHash = await bcrypt.hash('DemoPass123!', 12);
+    await prisma.user.create({
+      data: {
+        email,
+        passwordHash,
+        fullName: 'Demo User',
+        ageMode: 'ADULT',
+        skills: ['JavaScript', 'React', 'Teamwork'],
+        portfolioLinks: ['https://example.com'],
+      },
+    });
+    console.log('Seeded demo user:', email, 'password: DemoPass123!');
+  } else {
+    console.log('Demo user already exists');
+  }
+}
+
+main().finally(async () => {
+  await prisma.$disconnect();
+});
+
+----- /apps/web/src/lib/api.ts -----
+import axios from 'axios';
+
+export const api = axios.create({
+  baseURL: import.meta.env.VITE_API_URL || 'http://localhost:4000',
+  withCredentials: true,
+});
+
+export function setAuthToken(token?: string) {
+  if (token) {
+    api.defaults.headers.common['Authorization'] = `Bearer ${token}`;
+  } else {
+    delete api.defaults.headers.common['Authorization'];
+  }
+}
+
+----- /apps/web/src/store/auth.ts -----
+import { create } from 'zustand';
+
+type AuthState = {
+  accessToken?: string;
+  refreshToken?: string;
+  setTokens: (t?: { accessToken: string; refreshToken: string }) => void;
+  clear: () => void;
+};
+
+export const useAuth = create<AuthState>((set) => ({
+  accessToken: undefined,
+  refreshToken: undefined,
+  setTokens: (t) => set({ accessToken: t?.accessToken, refreshToken: t?.refreshToken }),
+  clear: () => set({ accessToken: undefined, refreshToken: undefined }),
+}));
+
+----- /apps/web/src/pages/auth/SignUp.tsx -----
+import React, { useState } from 'react';
+import { api } from '../../lib/api';
+import { Link, useNavigate } from 'react-router-dom';
+
+export default function SignUp() {
+  const nav = useNavigate();
+  const [form, setForm] = useState({ email: '', password: '', fullName: '', dob: '', guardianEmail: '' });
+  const [msg, setMsg] = useState<string>('');
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setMsg('');
+    try {
+      const { data } = await api.post('/auth/register', {
+        ...form,
+        guardianEmail: form.guardianEmail || undefined,
+      });
+      if (data.guardianRequired) {
+        setMsg('Registered. Guardian approval required. Check console for dev link.');
+      } else {
+        setMsg('Registered. Please verify your email (dev link in API logs).');
+      }
+      setTimeout(() => nav('/auth/signin'), 1200);
+    } catch (err: any) {
+      setMsg(err?.response?.data?.message || 'Error');
+    }
+  };
+
+  return (
+    <div className="max-w-md mx-auto p-6">
+      <h1 className="text-2xl font-bold mb-4">Create your account</h1>
+      <form onSubmit={submit} className="space-y-3">
+        <input className="w-full border p-2 rounded" placeholder="Full name" value={form.fullName} onChange={e => setForm({ ...form, fullName: e.target.value })} />
+        <input className="w-full border p-2 rounded" placeholder="Email" type="email" value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} />
+        <input className="w-full border p-2 rounded" placeholder="Password" type="password" value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} />
+        <label className="text-sm text-gray-600">Date of birth (youth safety)</label>
+        <input className="w-full border p-2 rounded" type="date" value={form.dob} onChange={e => setForm({ ...form, dob: e.target.value })} />
+        <input className="w-full border p-2 rounded" placeholder="Guardian email (if under 16)" type="email" value={form.guardianEmail} onChange={e => setForm({ ...form, guardianEmail: e.target.value })} />
+        <button className="w-full bg-indigo-600 text-white py-2 rounded font-semibold">Sign up</button>
+      </form>
+      {msg && <p className="mt-3 text-sm text-gray-700">{msg}</p>}
+      <p className="mt-4 text-sm">Already have an account? <Link to="/auth/signin" className="text-indigo-600">Sign in</Link></p>
+    </div>
+  );
+}
+
+----- /apps/web/src/pages/auth/SignIn.tsx -----
+import React, { useState } from 'react';
+import { api, setAuthToken } from '../../lib/api';
+import { useAuth } from '../../store/auth';
+import { Link, useNavigate } from 'react-router-dom';
+
+export default function SignIn() {
+  const nav = useNavigate();
+  const { setTokens } = useAuth();
+  const [form, setForm] = useState({ email: '', password: '' });
+  const [msg, setMsg] = useState<string>('');
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setMsg('');
+    try {
+      const { data } = await api.post('/auth/login', form);
+      setTokens(data.tokens);
+      setAuthToken(data.tokens.accessToken);
+      nav('/');
+    } catch (err: any) {
+      setMsg(err?.response?.data?.message || 'Error');
+    }
+  };
+
+  return (
+    <div className="max-w-md mx-auto p-6">
+      <h1 className="text-2xl font-bold mb-4">Sign in</h1>
+      <form onSubmit={submit} className="space-y-3">
+        <input className="w-full border p-2 rounded" placeholder="Email" type="email" value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} />
+        <input className="w-full border p-2 rounded" placeholder="Password" type="password" value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} />
+        <button className="w-full bg-indigo-600 text-white py-2 rounded font-semibold">Sign in</button>
+      </form>
+      {msg && <p className="mt-3 text-sm text-gray-700">{msg}</p>}
+      <p className="mt-4 text-sm">New here? <Link to="/auth/signup" className="text-indigo-600">Create an account</Link></p>
+    </div>
+  );
+}
+
+----- /apps/web/src/pages/auth/VerifyEmail.tsx -----
+import React, { useState } from 'react';
+import { api } from '../../lib/api';
+
+export default function VerifyEmail() {
+  const [token, setToken] = useState('');
+  const [msg, setMsg] = useState('');
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setMsg('');
+    try {
+      const { data } = await api.post('/auth/verify-email', { token });
+      setMsg(data.verified ? 'Email verified!' : 'Unexpected response');
+    } catch (err: any) {
+      setMsg(err?.response?.data?.message || 'Error');
+    }
+  };
+
+  return (
+    <div className="max-w-md mx-auto p-6">
+      <h1 className="text-2xl font-bold mb-4">Verify your email</h1>
+      <form onSubmit={submit} className="space-y-3">
+        <input className="w-full border p-2 rounded" placeholder="Paste token from dev console" value={token} onChange={e => setToken(e.target.value)} />
+        <button className="w-full bg-indigo-600 text-white py-2 rounded font-semibold">Verify</button>
+      </form>
+      {msg && <p className="mt-3 text-sm text-gray-700">{msg}</p>}
+    </div>
+  );
+}
+
+----- /apps/web/src/pages/auth/GuardianApprove.tsx -----
+import React, { useState } from 'react';
+import { api } from '../../lib/api';
+
+export default function GuardianApprove() {
+  const [token, setToken] = useState('');
+  const [msg, setMsg] = useState('');
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setMsg('');
+    try {
+      const { data } = await api.post('/auth/guardian/approve', { token });
+      setMsg(data.approved ? 'Guardian consent recorded.' : 'Unexpected response');
+    } catch (err: any) {
+      setMsg(err?.response?.data?.message || 'Error');
+    }
+  };
+
+  return (
+    <div className="max-w-md mx-auto p-6">
+      <h1 className="text-2xl font-bold mb-2">Guardian Consent</h1>
+      <p className="text-sm text-gray-600 mb-4">Paste the token from the dev mailer log to approve.</p>
+      <form onSubmit={submit} className="space-y-3">
+        <input className="w-full border p-2 rounded" placeholder="Token" value={token} onChange={e => setToken(e.target.value)} />
+        <button className="w-full bg-indigo-600 text-white py-2 rounded font-semibold">Approve</button>
+      </form>
+      {msg && <p className="mt-3 text-sm text-gray-700">{msg}</p>}
+    </div>
+  );
+}
+
+----- /apps/web/src/pages/ProfileGate.tsx -----
+import React, { useEffect, useState } from 'react';
+import { api, setAuthToken } from '../lib/api';
+import { useAuth } from '../store/auth';
+
+export default function ProfileGate() {
+  const { accessToken, refreshToken, setTokens, clear } = useAuth();
+  const [me, setMe] = useState<any>(null);
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        if (!accessToken && refreshToken) {
+          const { data } = await api.post('/auth/refresh', { refreshToken });
+          setTokens(data);
+          setAuthToken(data.accessToken);
+        }
+        const { data } = await api.get('/users/me');
+        setMe(data);
+      } catch (e) {
+        clear();
+      }
+    };
+    load();
+  }, []);
+
+  if (!me) return <div className="p-6">Loading…</div>;
+
+  return (
+    <div className="p-6">
+      <h2 className="text-xl font-semibold">Hello {me.fullName || 'there'}</h2>
+      <p className="text-gray-600">Age Mode: {me.ageMode}</p>
+      {me.ageMode === 'YOUTH' && !me.guardianVerifiedAt && (
+        <p className="text-sm text-yellow-700 mt-2">Guardian consent pending.</p>
+      )}
+    </div>
+  );
+}
+
+----- /apps/web/src/routes.tsx -----
+import React from 'react';
+import { createBrowserRouter, RouterProvider } from 'react-router-dom';
+import SignIn from './pages/auth/SignIn';
+import SignUp from './pages/auth/SignUp';
+import VerifyEmail from './pages/auth/VerifyEmail';
+import GuardianApprove from './pages/auth/GuardianApprove';
+import ProfileGate from './pages/ProfileGate';
+
+const router = createBrowserRouter([
+  { path: '/', element: <ProfileGate /> },
+  { path: '/auth/signin', element: <SignIn /> },
+  { path: '/auth/signup', element: <SignUp /> },
+  { path: '/auth/verify-email', element: <VerifyEmail /> },
+  { path: '/auth/guardian-approve', element: <GuardianApprove /> },
+]);
+
+export default function AppRoutes() {
+  return <RouterProvider router={router} />;
+}
+
+----- /apps/web/.env.example -----
+VITE_API_URL=http://localhost:4000
+
+----- /packages/contracts/src/user.ts -----
+export type AgeMode = 'YOUTH' | 'ADULT';
+
+export interface UserProfile {
+  id: string;
+  email: string;
+  fullName?: string;
+  headline?: string;
+  dob?: string;
+  ageMode: AgeMode;
+  guardianEmail?: string;
+  guardianVerifiedAt?: string;
+  emailVerifiedAt?: string;
+  country?: string;
+  city?: string;
+  availabilityHours?: number;
+  targetSalary?: number;
+  skills: string[];
+  portfolioLinks: string[];
+  isEmployer: boolean;
+  isVerifiedEmployer: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+----- /packages/contracts/src/index.ts -----
+export * from './user';
+
+----- /packages/sdk/src/index.ts -----
+import { UserProfile } from '@lockedin/contracts';
+
+export class LockedInSDK {
+  constructor(private baseUrl: string, private accessToken?: string) {}
+
+  setAccessToken(token?: string) {
+    this.accessToken = token;
+  }
+
+  private headers() {
+    return this.accessToken ? { Authorization: `Bearer ${this.accessToken}` } : {};
+  }
+
+  async me(): Promise<UserProfile | { anonymous: true }> {
+    const res = await fetch(`${this.baseUrl}/users/me`, { headers: this.headers() });
+    return res.json();
+  }
+
+  async register(input: { email: string; password: string; fullName: string; dob?: string; guardianEmail?: string }) {
+    const res = await fetch(`${this.baseUrl}/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    return res.json();
+  }
+
+  async login(input: { email: string; password: string }): Promise<{ tokens: { accessToken: string; refreshToken: string } }> {
+    const res = await fetch(`${this.baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    return res.json();
+  }
+
+  async verifyEmail(token: string) {
+    const res = await fetch(`${this.baseUrl}/auth/verify-email`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    return res.json();
+  }
+
+  async guardianApprove(token: string) {
+    const res = await fetch(`${this.baseUrl}/auth/guardian/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    return res.json();
+  }
+}
+
+----- /README-BUNDLE-01.md -----
+# LockedIn — Bundle 01 (Auth + Accounts)
+
+This bundle wires up:
+- API (NestJS + Prisma + Postgres): users, sessions, JWT, refresh tokens, email + guardian verification tokens.
+- Youth-safety logic: under 16 → guardian consent required, under 18 → YOUTH mode with stricter defaults.
+- Web (Vite + React): SignUp, SignIn, VerifyEmail, GuardianApprove, and a basic ProfileGate demo.
+- Contracts + SDK: shared UserProfile type and minimal client.
+
+## Run
+1) Ensure Postgres is up (see infra/docker-compose from Bundle 00).  
+2) In `/apps/api`: `cp .env.example .env` and update values if needed.  
+3) `pnpm -w --filter @lockedin/api prisma:generate`  
+4) `pnpm -w --filter @lockedin/api prisma:migrate`  
+5) `pnpm -w --filter @lockedin/api seed`  
+6) `pnpm -w --filter @lockedin/api dev`
+
+Check API logs for the dev mailer links when registering.  
+For web:
+1) In `/apps/web`: `cp .env.example .env`  
+2) `pnpm dev` and open http://localhost:5173
+
+## Notes
+- No real secrets are committed. The `.env.example` is safe.  
+- Email + guardian tokens are printed to the API console (dev mailer). A future bundle will add real email delivery.  
+- This integrates with the UI patterns you already built (Dashboard/Jobs/etc.) by providing `/users/me` and auth tokens.
+
+# End of Bundle 01

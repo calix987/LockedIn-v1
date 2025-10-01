@@ -1,0 +1,885 @@
+# LockedIn – Bundle 24: Trust & Safety + Youth Mode
+Version: v0.24.0
+Scope: Trust & Safety service, youth-mode guardrails, reporting, blocking, verification gates, content auto‑moderation, admin queue, and UI hooks.
+
+> This bundle plugs into the monorepo structure we’ve been building. No secrets included. Env vars are referenced but not committed. It’s designed to work locally with Postgres + Redis (optional) but has a pure-Node fallback for queues.
+
+---
+
+## Directory layout
+
+```
+/packages
+  /contracts
+    /src
+      safety.ts
+
+/services
+  /safety
+    /src
+      index.ts
+      routes
+        reports.ts
+        moderation.ts
+        blocks.ts
+        policies.ts
+        webhooks.ts
+      core
+        db.ts
+        automod.ts
+        actions.ts
+        policies.ts
+        validators.ts
+      types.ts
+    /migrations
+      001_create_safety_tables.sql
+      002_add_guardian_tables.sql
+    /package.json
+    /tsconfig.json
+    /.env.example
+    /README.md
+
+/web
+  /apps/lockedin
+    /src
+      middleware/withSafetyGuard.tsx
+      hooks/useYouthMode.ts
+      components/safety/SafetyReportDialog.tsx
+      components/safety/SafetyBadges.tsx
+      features/dm/SendMessageButton.tsx
+      features/jobs/YouthSafeNotice.tsx
+      pages/admin/ModerationQueue.tsx
+```
+
+---
+
+## packages/contracts/src/safety.ts
+```ts
+// packages/contracts/src/safety.ts
+export type TargetType = "profile" | "post" | "comment" | "job" | "message";
+
+export enum ReportReason {
+  SPAM = "SPAM",
+  HARASSMENT = "HARASSMENT",
+  HATE = "HATE",
+  SEXUAL_CONTENT = "SEXUAL_CONTENT",
+  CHILD_SAFETY = "CHILD_SAFETY",
+  SCAM_FRAUD = "SCAM_FRAUD",
+  VIOLENCE = "VIOLENCE",
+  OTHER = "OTHER",
+}
+
+export enum SafetyLabel {
+  NONE = "NONE",
+  LIMITED_REACH = "LIMITED_REACH",
+  HIDDEN_FOR_MINORS = "HIDDEN_FOR_MINORS",
+  SENSITIVE = "SENSITIVE",
+  VERIFIED_EMPLOYER = "VERIFIED_EMPLOYER",
+  VERIFIED_ID = "VERIFIED_ID",
+}
+
+export enum EnforcementAction {
+  WARN = "WARN",
+  REMOVE_CONTENT = "REMOVE_CONTENT",
+  LIMIT_DM = "LIMIT_DM",
+  SUSPEND = "SUSPEND",
+  BAN = "BAN",
+}
+
+export interface SafetyReportCreate {
+  reporterId: string;
+  targetType: TargetType;
+  targetId: string;
+  reason: ReportReason;
+  details?: string;
+  evidenceUrls?: string[];
+}
+
+export interface SafetyReport extends SafetyReportCreate {
+  id: string;
+  status: "OPEN" | "REVIEWED";
+  createdAt: string;
+  updatedAt: string;
+  labels: SafetyLabel[];
+}
+
+export interface ModerationDecision {
+  reportId: string;
+  action: EnforcementAction;
+  reasonNote?: string;
+  labels?: SafetyLabel[];
+}
+
+export interface PolicyConfig {
+  youth: {
+    dm: {
+      allowFromVerifiedEmployersOnly: boolean;
+      allowFromFriends: boolean;
+    };
+    jobPosts: {
+      requireOpenToMinorsFlag: boolean;
+      disallowInPersonMeetups: boolean;
+    };
+    visibility: {
+      hideSensitive: boolean;
+    };
+  };
+}
+```
+
+---
+
+## services/safety/.env.example
+```
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/lockedin
+PORT=5401
+NODE_ENV=development
+# Optional Redis if you plan to use BullMQ queues later
+REDIS_URL=redis://localhost:6379
+```
+
+---
+
+## services/safety/migrations/001_create_safety_tables.sql
+```sql
+CREATE TABLE IF NOT EXISTS safety_reports (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  reporter_id TEXT NOT NULL,
+  target_type TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  details TEXT,
+  evidence_urls TEXT[] DEFAULT ARRAY[]::TEXT[],
+  status TEXT NOT NULL DEFAULT 'OPEN',
+  labels TEXT[] DEFAULT ARRAY[]::TEXT[],
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS blocks (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  blocker_id TEXT NOT NULL,
+  blocked_user_id TEXT,
+  blocked_company_id TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (blocker_id, blocked_user_id),
+  UNIQUE (blocker_id, blocked_company_id)
+);
+
+CREATE TABLE IF NOT EXISTS moderation_audit (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  report_id UUID REFERENCES safety_reports(id) ON DELETE SET NULL,
+  moderator_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  reason_note TEXT,
+  applied_labels TEXT[] DEFAULT ARRAY[]::TEXT[],
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Labels cache per content id
+CREATE TABLE IF NOT EXISTS content_labels (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  target_type TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  labels TEXT[] NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(target_type, target_id)
+);
+```
+
+---
+
+## services/safety/migrations/002_add_guardian_tables.sql
+```sql
+-- Guardian oversight stubs (opt-in)
+CREATE TABLE IF NOT EXISTS guardian_links (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  youth_user_id TEXT NOT NULL,
+  guardian_email TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'INVITED', -- INVITED | ACTIVE | REVOKED
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS user_flags (
+  user_id TEXT PRIMARY KEY,
+  youth_mode BOOLEAN NOT NULL DEFAULT FALSE,
+  verified_employer BOOLEAN NOT NULL DEFAULT FALSE,
+  verified_id BOOLEAN NOT NULL DEFAULT FALSE,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+---
+
+## services/safety/src/types.ts
+```ts
+// services/safety/src/types.ts
+import { ReportReason, EnforcementAction, SafetyLabel, PolicyConfig, TargetType } from "../../../packages/contracts/src/safety";
+
+export type { ReportReason, EnforcementAction, SafetyLabel, PolicyConfig, TargetType };
+
+export interface Env {
+  DATABASE_URL: string;
+  PORT: number;
+  NODE_ENV: "development" | "production" | "test";
+  REDIS_URL?: string;
+}
+```
+
+---
+
+## services/safety/src/core/db.ts
+```ts
+// services/safety/src/core/db.ts
+import pg from "pg";
+
+const { Pool } = pg;
+
+export const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 10,
+});
+
+export async function query<T = any>(text: string, params?: any[]): Promise<{ rows: T[] }> {
+  const client = await pool.connect();
+  try {
+    const res = await client.query<T>(text, params);
+    return res;
+  } finally {
+    client.release();
+  }
+}
+```
+
+---
+
+## services/safety/src/core/policies.ts
+```ts
+// services/safety/src/core/policies.ts
+import { PolicyConfig } from "../types";
+
+export const DefaultPolicies: PolicyConfig = {
+  youth: {
+    dm: {
+      allowFromVerifiedEmployersOnly: true,
+      allowFromFriends: true,
+    },
+    jobPosts: {
+      requireOpenToMinorsFlag: true,
+      disallowInPersonMeetups: true,
+    },
+    visibility: {
+      hideSensitive: true,
+    },
+  },
+};
+
+export function getPolicy(): PolicyConfig {
+  // If you want dynamic policies, load from DB. For now return defaults.
+  return DefaultPolicies;
+}
+```
+
+---
+
+## services/safety/src/core/validators.ts
+```ts
+// services/safety/src/core/validators.ts
+import { ReportReason, TargetType } from "../types";
+
+export function isValidReason(reason: string): reason is ReportReason {
+  return Object.values(ReportReason).includes(reason as ReportReason);
+}
+
+export function isValidTargetType(t: string): t is TargetType {
+  return ["profile","post","comment","job","message"].includes(t);
+}
+```
+
+---
+
+## services/safety/src/core/automod.ts
+```ts
+// services/safety/src/core/automod.ts
+import { SafetyLabel } from "../types";
+
+export interface AutomodInput {
+  targetType: "post" | "comment" | "job" | "message" | "profile";
+  targetId: string;
+  text?: string;
+  metadata?: Record<string, any>;
+  isYouthAudience?: boolean;
+}
+
+const bannedWordFragments = [
+  "crypto get rich",
+  "send gift card",
+  "cashapp",
+  "telegram://",
+];
+
+const sensitivePhrases = ["meet in person", "private location", "come alone"];
+
+const contactPIIRegex = /\b(\+?\d{7,}|\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b)\b/i;
+
+export function scoreContent(input: AutomodInput) {
+  const text = (input.text || "").toLowerCase();
+
+  let labels: SafetyLabel[] = [];
+  let reasons: string[] = [];
+
+  if (bannedWordFragments.some(k => text.includes(k))) {
+    labels.push(SafetyLabel.LIMITED_REACH);
+    reasons.push("spam/scam fragment");
+  }
+
+  if (contactPIIRegex.test(text)) {
+    labels.push(SafetyLabel.SENSITIVE);
+    reasons.push("contact PII detected");
+  }
+
+  if (input.isYouthAudience && sensitivePhrases.some(k => text.includes(k))) {
+    labels.push(SafetyLabel.HIDDEN_FOR_MINORS);
+    reasons.push("in‑person meetup language hidden for minors");
+  }
+
+  // Deduplicate
+  labels = Array.from(new Set(labels));
+
+  return { labels, reasons };
+}
+```
+
+---
+
+## services/safety/src/core/actions.ts
+```ts
+// services/safety/src/core/actions.ts
+import { query } from "./db";
+import { EnforcementAction, SafetyLabel } from "../types";
+
+export async function applyEnforcement({
+  reportId,
+  moderatorId,
+  action,
+  reasonNote,
+  labels = [],
+}: {
+  reportId: string;
+  moderatorId: string;
+  action: EnforcementAction;
+  reasonNote?: string;
+  labels?: SafetyLabel[];
+}) {
+  // Update report
+  await query("UPDATE safety_reports SET status='REVIEWED', updated_at=NOW() WHERE id=$1", [reportId]);
+
+  // Audit log
+  await query(
+    "INSERT INTO moderation_audit (report_id, moderator_id, action, reason_note, applied_labels) VALUES ($1,$2,$3,$4,$5)",
+    [reportId, moderatorId, action, reasonNote || null, labels]
+  );
+}
+```
+
+---
+
+## services/safety/src/routes/reports.ts
+```ts
+// services/safety/src/routes/reports.ts
+import { FastifyInstance } from "fastify";
+import { isValidReason, isValidTargetType } from "../core/validators";
+import { query } from "../core/db";
+import { ReportReason, SafetyLabel } from "../types";
+
+export default async function reportsRoutes(app: FastifyInstance) {
+  app.post("/reports", async (req, reply) => {
+    const body = req.body as any;
+    const { reporterId, targetType, targetId, reason, details, evidenceUrls } = body || {};
+
+    if (!reporterId || !isValidTargetType(targetType) || !targetId || !isValidReason(reason)) {
+      return reply.code(400).send({ error: "Invalid payload" });
+    }
+
+    const res = await query(
+      `INSERT INTO safety_reports (reporter_id, target_type, target_id, reason, details, evidence_urls)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [reporterId, targetType, targetId, reason as ReportReason, details || null, evidenceUrls || []]
+    );
+
+    return reply.code(201).send(res.rows[0]);
+  });
+
+  app.get("/reports/:id", async (req, reply) => {
+    // auth: reporter or admin — wire via gateway
+    const { id } = req.params as any;
+    const res = await query("SELECT * FROM safety_reports WHERE id=$1", [id]);
+    if (!res.rows[0]) return reply.code(404).send({ error: "Not found" });
+    return reply.send(res.rows[0]);
+  });
+}
+```
+
+---
+
+## services/safety/src/routes/blocks.ts
+```ts
+// services/safety/src/routes/blocks.ts
+import { FastifyInstance } from "fastify";
+import { query } from "../core/db";
+
+export default async function blocksRoutes(app: FastifyInstance) {
+  app.post("/blocks", async (req, reply) => {
+    const { blockerId, blockedUserId, blockedCompanyId } = req.body as any;
+    if (!blockerId || (!blockedUserId && !blockedCompanyId)) {
+      return reply.code(400).send({ error: "Invalid payload" });
+    }
+
+    const res = await query(
+      `INSERT INTO blocks (blocker_id, blocked_user_id, blocked_company_id)
+       VALUES ($1,$2,$3) ON CONFLICT DO NOTHING RETURNING *`,
+      [blockerId, blockedUserId || null, blockedCompanyId || null]
+    );
+    return reply.code(201).send(res.rows[0] || { ok: true });
+  });
+
+  app.get("/blocks/:userId", async (req, reply) => {
+    const { userId } = req.params as any;
+    const res = await query("SELECT * FROM blocks WHERE blocker_id=$1", [userId]);
+    return reply.send(res.rows);
+  });
+}
+```
+
+---
+
+## services/safety/src/routes/policies.ts
+```ts
+// services/safety/src/routes/policies.ts
+import { FastifyInstance } from "fastify";
+import { getPolicy } from "../core/policies";
+
+export default async function policiesRoutes(app: FastifyInstance) {
+  app.get("/policies", async (_req, reply) => {
+    return reply.send(getPolicy());
+  });
+}
+```
+
+---
+
+## services/safety/src/routes/moderation.ts
+```ts
+// services/safety/src/routes/moderation.ts
+import { FastifyInstance } from "fastify";
+import { query } from "../core/db";
+import { applyEnforcement } from "../core/actions";
+import { EnforcementAction, SafetyLabel } from "../types";
+
+export default async function moderationRoutes(app: FastifyInstance) {
+  // NOTE: Protect these routes with admin auth at the gateway (not shown here).
+  app.get("/moderation/queue", async (_req, reply) => {
+    const res = await query("SELECT * FROM safety_reports WHERE status='OPEN' ORDER BY created_at ASC");
+    return reply.send(res.rows);
+  });
+
+  app.post("/moderation/decide", async (req, reply) => {
+    const { reportId, moderatorId, action, reasonNote, labels } = req.body as {
+      reportId: string; moderatorId: string; action: EnforcementAction; reasonNote?: string; labels?: SafetyLabel[];
+    };
+    if (!reportId || !moderatorId || !action) return reply.code(400).send({ error: "Missing fields" });
+    await applyEnforcement({ reportId, moderatorId, action, reasonNote, labels });
+    return reply.send({ ok: true });
+  });
+}
+```
+
+---
+
+## services/safety/src/routes/webhooks.ts
+```ts
+// services/safety/src/routes/webhooks.ts
+import { FastifyInstance } from "fastify";
+import { scoreContent } from "../core/automod";
+import { query } from "../core/db";
+import { SafetyLabel } from "../types";
+
+export default async function webhooksRoutes(app: FastifyInstance) {
+  app.post("/webhooks/content_ingest", async (req, reply) => {
+    const { targetType, targetId, text, isYouthAudience } = req.body as any;
+    if (!targetType || !targetId) return reply.code(400).send({ error: "Invalid payload" });
+
+    const { labels, reasons } = scoreContent({ targetType, targetId, text, isYouthAudience });
+
+    if (labels.length) {
+      const upsert = await query(
+        `INSERT INTO content_labels (target_type, target_id, labels)
+         VALUES ($1,$2,$3)
+         ON CONFLICT (target_type, target_id) DO UPDATE SET labels=EXCLUDED.labels, updated_at=NOW()
+         RETURNING *`,
+        [targetType, targetId, labels as SafetyLabel[]]
+      );
+      return reply.send({ labels: upsert.rows[0].labels, reasons });
+    }
+
+    return reply.send({ labels: [], reasons });
+  });
+}
+```
+
+---
+
+## services/safety/src/index.ts
+```ts
+// services/safety/src/index.ts
+import Fastify from "fastify";
+import reportsRoutes from "./routes/reports";
+import moderationRoutes from "./routes/moderation";
+import blocksRoutes from "./routes/blocks";
+import policiesRoutes from "./routes/policies";
+import webhooksRoutes from "./routes/webhooks";
+
+const app = Fastify({ logger: true });
+
+app.register(reportsRoutes);
+app.register(moderationRoutes);
+app.register(blocksRoutes);
+app.register(policiesRoutes);
+app.register(webhooksRoutes);
+
+const PORT = Number(process.env.PORT || 5401);
+app.listen({ port: PORT, host: "0.0.0.0" }).then(() => {
+  app.log.info(`Safety service running on :${PORT}`);
+});
+```
+
+---
+
+## services/safety/package.json
+```json
+{
+  "name": "@lockedin/safety",
+  "version": "0.24.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node --enable-source-maps dist/index.js",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "fastify": "^4.26.2",
+    "pg": "^8.11.5"
+  },
+  "devDependencies": {
+    "tsx": "^4.16.2",
+    "typescript": "^5.4.5"
+  }
+}
+```
+
+---
+
+## services/safety/tsconfig.json
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "Node",
+    "outDir": "dist",
+    "rootDir": "src",
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "strict": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
+```
+
+---
+
+## services/safety/README.md
+```
+# Safety Service
+Handles: reports, moderation queue, content labeling (automod), blocks, youth policies.
+
+## Setup
+1. Create DB & run migrations in /migrations.
+2. `cp .env.example .env` and set DATABASE_URL.
+3. `npm i && npm run dev`
+
+## Endpoints
+- POST /reports
+- GET  /reports/:id
+- POST /blocks
+- GET  /blocks/:userId
+- GET  /moderation/queue (admin)
+- POST /moderation/decide (admin)
+- GET  /policies
+- POST /webhooks/content_ingest
+
+## Integration
+- Gateway should enforce auth (scopes: user, admin).
+- Content services (posts, messages, jobs) should call `/webhooks/content_ingest` on creation/update.
+- Web app should call `/policies` to configure youth mode UX.
+
+## Notes
+- This is a minimal, audit‑friendly design: every decision is logged.
+- No secrets checked in.
+```
+
+---
+
+## web/apps/lockedin/src/hooks/useYouthMode.ts
+```ts
+// web/apps/lockedin/src/hooks/useYouthMode.ts
+import { useEffect, useState } from "react";
+
+export function useYouthMode(user?: { age_mode?: "YOUTH" | "ADULT" }) {
+  const [policies, setPolicies] = useState<any>(null);
+  const isYouth = user?.age_mode === "YOUTH";
+
+  useEffect(() => {
+    fetch("/api/safety/policies")
+      .then(r => r.json())
+      .then(setPolicies)
+      .catch(() => setPolicies(null));
+  }, []);
+
+  return {
+    isYouth,
+    policies,
+    canReceiveDM(from: { verified_employer?: boolean; isFriend?: boolean }) {
+      if (!isYouth || !policies) return true;
+      const rules = policies.youth.dm;
+      if (from.isFriend && rules.allowFromFriends) return true;
+      if (from.verified_employer && rules.allowFromVerifiedEmployersOnly) return true;
+      return false;
+    },
+  };
+}
+```
+
+---
+
+## web/apps/lockedin/src/middleware/withSafetyGuard.tsx
+```tsx
+// web/apps/lockedin/src/middleware/withSafetyGuard.tsx
+import React from "react";
+import { useYouthMode } from "../hooks/useYouthMode";
+
+type Props = {
+  user: any;
+  children: (ctx: ReturnType<typeof useYouthMode>) => React.ReactNode;
+};
+
+export default function WithSafetyGuard({ user, children }: Props) {
+  const ctx = useYouthMode(user);
+  return <>{children(ctx)}</>;
+}
+```
+
+---
+
+## web/apps/lockedin/src/components/safety/SafetyReportDialog.tsx
+```tsx
+// web/apps/lockedin/src/components/safety/SafetyReportDialog.tsx
+import React, { useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
+
+const REASONS = [
+  "SPAM","HARASSMENT","HATE","SEXUAL_CONTENT","CHILD_SAFETY","SCAM_FRAUD","VIOLENCE","OTHER"
+];
+
+export function SafetyReportDialog({ targetType, targetId, trigger }:{targetType:string; targetId:string; trigger?: React.ReactNode}) {
+  const [open, setOpen] = useState(false);
+  const [reason, setReason] = useState<string>("SPAM");
+  const [details, setDetails] = useState<string>("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const submit = async () => {
+    setSubmitting(true);
+    try {
+      await fetch("/api/safety/reports", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reporterId: "me", targetType, targetId, reason, details }),
+      });
+      setOpen(false);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <>
+      <span onClick={() => setOpen(true)}>{trigger || <Button variant="outline" size="sm">Report</Button>}</span>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Report content</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            <label className="text-sm">Reason</label>
+            <Select value={reason} onValueChange={setReason}>
+              <SelectTrigger><SelectValue placeholder="Choose reason" /></SelectTrigger>
+              <SelectContent>
+                {REASONS.map(r => <SelectItem key={r} value={r}>{r.replace("_"," ")}</SelectItem>)}
+              </SelectContent>
+            </Select>
+            <label className="text-sm">Details (optional)</label>
+            <textarea className="w-full border rounded p-2" rows={4} value={details} onChange={e=>setDetails(e.target.value)} />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={()=>setOpen(false)}>Cancel</Button>
+            <Button onClick={submit} disabled={submitting}>{submitting ? "Submitting..." : "Submit"}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+```
+
+---
+
+## web/apps/lockedin/src/components/safety/SafetyBadges.tsx
+```tsx
+// web/apps/lockedin/src/components/safety/SafetyBadges.tsx
+import React from "react";
+
+export function VerifiedEmployerBadge() {
+  return (
+    <span className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium bg-emerald-100 text-emerald-800 rounded">
+      <svg width="12" height="12" viewBox="0 0 24 24" className="text-emerald-600">
+        <path fill="currentColor" d="M12 2l3 3h4v4l3 3-3 3v4h-4l-3 3-3-3H5v-4l-3-3 3-3V5h4z"/>
+        <path fill="#fff" d="M10.5 13.5l-2-2 1.4-1.4 0.6 0.6 3-3 1.4 1.4z"/>
+      </svg>
+      Verified Employer
+    </span>
+  );
+}
+```
+
+---
+
+## web/apps/lockedin/src/features/dm/SendMessageButton.tsx
+```tsx
+// web/apps/lockedin/src/features/dm/SendMessageButton.tsx
+import React from "react";
+import { Button } from "@/components/ui/button";
+import WithSafetyGuard from "@/middleware/withSafetyGuard";
+
+export default function SendMessageButton({ me, to }:{me:any; to:any}) {
+  return (
+    <WithSafetyGuard user={me}>
+      {({ isYouth, canReceiveDM }) => {
+        const allowed = canReceiveDM({ verified_employer: !!to?.verified_employer, isFriend: !!to?.isFriend });
+        if (isYouth && !allowed) {
+          return <Button disabled title="Messaging restricted in youth mode">Message</Button>;
+        }
+        return <Button>Message</Button>;
+      }}
+    </WithSafetyGuard>
+  );
+}
+```
+
+---
+
+## web/apps/lockedin/src/features/jobs/YouthSafeNotice.tsx
+```tsx
+// web/apps/lockedin/src/features/jobs/YouthSafeNotice.tsx
+import React from "react";
+
+export default function YouthSafeNotice() {
+  return (
+    <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm">
+      Youth-Safe: Only verified employers can contact minors. In‑person meetings are disabled.
+    </div>
+  );
+}
+```
+
+---
+
+## web/apps/lockedin/src/pages/admin/ModerationQueue.tsx
+```tsx
+// web/apps/lockedin/src/pages/admin/ModerationQueue.tsx
+import React, { useEffect, useState } from "react";
+import { Button } from "@/components/ui/button";
+
+export default function ModerationQueue() {
+  const [items, setItems] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetch("/api/safety/moderation/queue").then(r=>r.json()).then(setItems).finally(()=>setLoading(false));
+  }, []);
+
+  const decide = async (reportId: string, action: string) => {
+    await fetch("/api/safety/moderation/decide", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reportId, action, moderatorId: "admin" }),
+    });
+    setItems(prev => prev.filter(x => x.id !== reportId));
+  };
+
+  if (loading) return <div>Loading…</div>;
+
+  return (
+    <div className="max-w-4xl mx-auto p-6 space-y-4">
+      <h1 className="text-2xl font-bold">Moderation Queue</h1>
+      {items.map(item => (
+        <div key={item.id} className="border rounded p-4 bg-white/80">
+          <div className="text-sm text-gray-500">{item.target_type} · {item.reason}</div>
+          <div className="font-medium">{item.details || "No details"}</div>
+          <div className="flex gap-2 mt-3">
+            <Button variant="outline" onClick={()=>decide(item.id, "WARN")}>Warn</Button>
+            <Button variant="outline" onClick={()=>decide(item.id, "REMOVE_CONTENT")}>Remove</Button>
+            <Button variant="destructive" onClick={()=>decide(item.id, "SUSPEND")}>Suspend</Button>
+          </div>
+        </div>
+      ))}
+      {items.length === 0 && <div>No items in queue 🎉</div>}
+    </div>
+  );
+}
+```
+
+---
+
+## Gateway wiring (example)
+Add reverse proxy routes so the web app calls `/api/safety/*` and it forwards to the safety service:
+```ts
+// gateway/src/routes/safety-proxy.ts (example)
+app.all("/api/safety/*", async (req, reply) => {
+  const url = req.url.replace("/api/safety", "");
+  const resp = await fetch(`http://safety:5401${url}`, {
+    method: req.method,
+    headers: { "Content-Type": "application/json", authorization: req.headers.authorization || "" },
+    body: ["GET","HEAD"].includes(req.method) ? undefined : JSON.stringify(req.body || {}),
+  });
+  reply.code(resp.status).send(await resp.json());
+});
+```
+
+---
+
+## How this bundle interacts with other features
+- **Messaging**: check `useYouthMode.canReceiveDM` before showing send controls; backend should also enforce on message-create.
+- **Jobs**: when `open_to_minors=true`, gateway should prevent fields like “in‑person interview required” and force verified employers.
+- **Profiles**: show badges (Verified Employer / Verified ID) via content labels or user_flags table.
+- **Posting**: call `/webhooks/content_ingest` with `{ targetType:'post', targetId, text, isYouthAudience }` and respect returned labels in feed ranking and visibility.
+
+---
+
+## Next steps (following bundle)
+- Enforce server-side DM policing in the messaging service.
+- Job posting validator that calls safety policies before create/update.
+- Guardian activation flow (email invite + dashboard) if you decide to enable it.

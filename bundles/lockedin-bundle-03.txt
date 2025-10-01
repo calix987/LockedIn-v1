@@ -1,0 +1,1173 @@
+LOCKEDIN — BUNDLE 03 (Jobs & Applications)
+Split this file by the delimiters and place each file at the given path in your repo.
+All paths are relative to the repo root.
+
+──────────────────────────────────────────────────────────────────────────────
+HOW TO APPLY THIS BUNDLE
+1) For each section that starts with: 
+   ----- /path/from/repo/root -----
+   create that file and paste the contents beneath it.
+2) If a file already exists in your repo, **merge** the additions instead of overwriting.
+3) Run DB migration (Prisma):
+   - cd backend
+   - npx prisma migrate dev --name jobs_and_applications_v1
+   - npx prisma generate
+4) Rebuild API & web:
+   - backend: npm run start:dev (or yarn/nx equivalent)
+   - web: npm run dev
+5) Open http://localhost:5173 (or your FE dev server) and test:
+   - Jobs listing, filtering, applying
+   - Applications tracker
+
+This bundle assumes you already have:
+- NestJS backend with Prisma and JWT auth
+- A User model (with `id`, `ageMode`, etc.); if you used different casing, adjust where noted
+- React app with Tailwind + shadcn/ui + react-router and a base Layout
+- A shared http client or SDK; if not, we include minimal client calls here
+
+Youth-safety rules in this bundle:
+- If the requester is in YOUTH mode, jobs returned by API are restricted to `openToMinors = true`, `minAge <= 17`
+- Employers must be `verifiedCompany = true` to contact users in YOUTH mode (enforced elsewhere; here we add flags + server checks)
+
+No secrets included; environment values are expected to be set in your own .env.
+
+──────────────────────────────────────────────────────────────────────────────
+
+----- /backend/prisma/schema.prisma (ADD/MERGE these models) -----
+model Job {
+  id               String    @id @default(cuid())
+  title            String
+  companyName      String
+  description      String
+  locationType     JobLocationType
+  locations        String[]  @default([]) // city, region, etc.
+  payMin           Int?
+  payMax           Int?
+  payType          JobPayType?
+  currency         String     @default("USD")
+  experienceLevel  ExperienceLevel
+  minAge           Int?       // if set, used for gatekeeping youth results
+  openToMinors     Boolean    @default(false)
+  requiredSkills   String[]   @default([])
+  preferredSkills  String[]   @default([])
+  benefits         String[]   @default([])
+  requirements     String[]   @default([])
+  applicationDeadline DateTime?
+  verifiedCompany  Boolean    @default(false)
+  verifiedPay      Boolean    @default(false)
+  tags             String[]   @default([])
+  externalUrl      String?
+
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  applications     Application[]
+}
+
+model Application {
+  id              String      @id @default(cuid())
+  jobId           String
+  userId          String
+  status          ApplicationStatus @default(SAVED)
+  coverLetter     String?
+  tailoredResume  Json?
+  fitScore        Int?
+  keywordMatches  String[]     @default([])
+  missingKeywords String[]     @default([])
+  notes           String?
+  interviewDate   DateTime?
+  events          ApplicationEvent[]
+
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  job             Job          @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  user            User         @relation(fields: [userId], references: [id], onDelete: Cascade) // Make sure you have a User model
+}
+
+model ApplicationEvent {
+  id            String   @id @default(cuid())
+  applicationId String
+  type          String
+  occurredAt    DateTime @default(now())
+  description   String?
+
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+}
+
+enum JobLocationType {
+  REMOTE
+  ONSITE
+  HYBRID
+}
+
+enum JobPayType {
+  HOURLY
+  SALARY
+  STIPEND
+}
+
+enum ExperienceLevel {
+  ENTRY
+  JUNIOR
+  MID
+  SENIOR
+}
+
+enum ApplicationStatus {
+  SAVED
+  DRAFTED
+  APPLIED
+  INTERVIEW
+  OFFER
+  REJECTED
+}
+
+----- /backend/src/modules/jobs/dto/create-job.dto.ts -----
+import { IsArray, IsBoolean, IsDateString, IsEnum, IsInt, IsOptional, IsString, IsUrl, Max, Min } from 'class-validator';
+import { ExperienceLevel, JobLocationType, JobPayType } from '@prisma/client';
+
+export class CreateJobDto {
+  @IsString() title!: string;
+  @IsString() companyName!: string;
+  @IsString() description!: string;
+
+  @IsEnum(JobLocationType) locationType!: JobLocationType;
+  @IsArray() @IsString({ each: true }) @IsOptional() locations?: string[];
+
+  @IsOptional() @IsInt() @Min(0) payMin?: number;
+  @IsOptional() @IsInt() @Min(0) payMax?: number;
+  @IsOptional() @IsEnum(JobPayType) payType?: JobPayType;
+  @IsOptional() @IsString() currency?: string;
+
+  @IsEnum(ExperienceLevel) experienceLevel!: ExperienceLevel;
+
+  @IsOptional() @IsInt() @Min(13) @Max(99) minAge?: number;
+  @IsBoolean() @IsOptional() openToMinors?: boolean;
+
+  @IsArray() @IsString({ each: true }) @IsOptional() requiredSkills?: string[];
+  @IsArray() @IsString({ each: true }) @IsOptional() preferredSkills?: string[];
+  @IsArray() @IsString({ each: true }) @IsOptional() benefits?: string[];
+  @IsArray() @IsString({ each: true }) @IsOptional() requirements?: string[];
+
+  @IsOptional() @IsDateString() applicationDeadline?: string;
+  @IsOptional() @IsBoolean() verifiedCompany?: boolean;
+  @IsOptional() @IsBoolean() verifiedPay?: boolean;
+  @IsArray() @IsString({ each: true }) @IsOptional() tags?: string[];
+  @IsOptional() @IsUrl() externalUrl?: string;
+}
+
+----- /backend/src/modules/jobs/dto/update-job.dto.ts -----
+import { PartialType } from '@nestjs/mapped-types';
+import { CreateJobDto } from './create-job.dto';
+
+export class UpdateJobDto extends PartialType(CreateJobDto) {}
+
+----- /backend/src/modules/jobs/jobs.filters.ts -----
+export type JobQuery = {
+  search?: string;
+  experience?: 'ENTRY' | 'JUNIOR' | 'MID' | 'SENIOR' | 'all';
+  location?: 'REMOTE' | 'ONSITE' | 'HYBRID' | 'all';
+  payType?: 'HOURLY' | 'SALARY' | 'STIPEND' | 'all';
+  verifiedOnly?: boolean | 'true' | 'false';
+  youthFriendly?: boolean | 'true' | 'false';
+  limit?: string;
+  orderBy?: 'createdAt' | '-createdAt';
+};
+
+export const normalizeBool = (v: any): boolean | undefined => {
+  if (v === undefined) return undefined;
+  if (v === true || v === 'true') return true;
+  if (v === false || v === 'false') return false;
+  return undefined;
+};
+
+----- /backend/src/modules/jobs/jobs.repository.ts -----
+import { Injectable } from '@nestjs/common';
+import { PrismaService } from '../../prisma/prisma.service';
+import { Prisma, ExperienceLevel, JobLocationType, JobPayType } from '@prisma/client';
+import { JobQuery, normalizeBool } from './jobs.filters';
+
+@Injectable()
+export class JobsRepository {
+  constructor(private prisma: PrismaService) {}
+
+  buildWhere(q: JobQuery, isYouth: boolean): Prisma.JobWhereInput {
+    const where: Prisma.JobWhereInput = {};
+
+    if (q.search) {
+      const s = q.search.trim();
+      where.OR = [
+        { title: { contains: s, mode: 'insensitive' } },
+        { companyName: { contains: s, mode: 'insensitive' } },
+        { description: { contains: s, mode: 'insensitive' } },
+        { tags: { has: s } },
+        { requiredSkills: { has: s } },
+      ];
+    }
+
+    if (q.experience && q.experience !== 'all') where.experienceLevel = q.experience as ExperienceLevel;
+    if (q.location && q.location !== 'all') where.locationType = q.location as JobLocationType;
+    if (q.payType && q.payType !== 'all') where.payType = q.payType as JobPayType;
+
+    const verifiedOnly = normalizeBool(q.verifiedOnly);
+    if (verifiedOnly) where.verifiedCompany = true;
+
+    const youthFriendly = normalizeBool(q.youthFriendly);
+    if (isYouth || youthFriendly) {
+      where.AND = [
+        ...(where.AND ?? []),
+        { openToMinors: true },
+        { OR: [{ minAge: { lte: 17 } }, { minAge: null }] },
+        { verifiedCompany: true },
+      ];
+    }
+
+    return where;
+  }
+
+  async list(q: JobQuery, isYouth: boolean) {
+    const where = this.buildWhere(q, isYouth);
+    const take = q.limit ? Math.min(parseInt(q.limit, 10) || 20, 100) : 20;
+    const orderBy = q.orderBy === '-createdAt' ? { createdAt: 'desc' } : { createdAt: 'asc' };
+    return this.prisma.job.findMany({ where, take, orderBy });
+  }
+
+  getById(id: string) {
+    return this.prisma.job.findUnique({ where: { id } });
+  }
+
+  create(data: Prisma.JobCreateInput) {
+    return this.prisma.job.create({ data });
+  }
+
+  update(id: string, data: Prisma.JobUpdateInput) {
+    return this.prisma.job.update({ where: { id }, data });
+  }
+
+  delete(id: string) {
+    return this.prisma.job.delete({ where: { id } });
+  }
+}
+
+----- /backend/src/modules/jobs/jobs.service.ts -----
+import { Injectable, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { JobsRepository } from './jobs.repository';
+import { CreateJobDto } from './dto/create-job.dto';
+import { UpdateJobDto } from './dto/update-job.dto';
+
+type RequestUser = { id: string; role?: string; ageMode?: 'YOUTH' | 'ADULT' | null };
+
+@Injectable()
+export class JobsService {
+  constructor(private repo: JobsRepository) {}
+
+  list(query: any, user?: RequestUser) {
+    const isYouth = user?.ageMode === 'YOUTH';
+    return this.repo.list(query, !!isYouth);
+  }
+
+  async get(id: string, user?: RequestUser) {
+    const job = await this.repo.getById(id);
+    if (!job) throw new NotFoundException('Job not found');
+    if (user?.ageMode === 'YOUTH') {
+      if (!job.openToMinors || (job.minAge && job.minAge > 17) || !job.verifiedCompany) {
+        throw new ForbiddenException('This job is not available in youth-safety mode');
+      }
+    }
+    return job;
+  }
+
+  async create(dto: CreateJobDto, user?: RequestUser) {
+    // Adjust this policy based on your roles; prevent unverified employers from posting youth jobs
+    if (user?.role !== 'EMPLOYER' && user?.role !== 'ADMIN') {
+      throw new ForbiddenException('Only employers can create jobs');
+    }
+    if (dto.openToMinors && !dto.verifiedCompany) {
+      throw new ForbiddenException('Youth-open roles require verifiedCompany=true');
+    }
+    return this.repo.create({
+      ...dto,
+      applicationDeadline: dto.applicationDeadline ? new Date(dto.applicationDeadline) : undefined,
+    } as any);
+  }
+
+  async update(id: string, dto: UpdateJobDto, user?: RequestUser) {
+    // Extend with ownership checks for employer vs job
+    if (dto.openToMinors && dto.verifiedCompany === false) {
+      throw new ForbiddenException('Youth-open roles require verifiedCompany=true');
+    }
+    return this.repo.update(id, {
+      ...dto,
+      applicationDeadline: dto.applicationDeadline ? new Date(dto.applicationDeadline) : undefined,
+    } as any);
+  }
+
+  remove(id: string) {
+    return this.repo.delete(id);
+  }
+}
+
+----- /backend/src/modules/jobs/jobs.controller.ts -----
+import { Controller, Get, Param, Query, Post, Body, Patch, Delete, Req } from '@nestjs/common';
+import { JobsService } from './jobs.service';
+import { CreateJobDto } from './dto/create-job.dto';
+import { UpdateJobDto } from './dto/update-job.dto';
+
+@Controller('jobs')
+export class JobsController {
+  constructor(private service: JobsService) {}
+
+  @Get()
+  list(@Query() query: any, @Req() req: any) {
+    return this.service.list(query, req?.user);
+  }
+
+  @Get(':id')
+  get(@Param('id') id: string, @Req() req: any) {
+    return this.service.get(id, req?.user);
+  }
+
+  @Post()
+  create(@Body() dto: CreateJobDto, @Req() req: any) {
+    return this.service.create(dto, req?.user);
+  }
+
+  @Patch(':id')
+  update(@Param('id') id: string, @Body() dto: UpdateJobDto, @Req() req: any) {
+    return this.service.update(id, dto, req?.user);
+  }
+
+  @Delete(':id')
+  remove(@Param('id') id: string) {
+    return this.service.remove(id);
+  }
+}
+
+----- /backend/src/modules/jobs/jobs.module.ts -----
+import { Module } from '@nestjs/common';
+import { JobsController } from './jobs.controller';
+import { JobsService } from './jobs.service';
+import { JobsRepository } from './jobs.repository';
+import { PrismaService } from '../../prisma/prisma.service';
+
+@Module({
+  controllers: [JobsController],
+  providers: [JobsService, JobsRepository, PrismaService],
+  exports: [JobsService],
+})
+export class JobsModule {}
+
+----- /backend/src/modules/applications/dto/create-application.dto.ts -----
+import { IsEnum, IsOptional, IsString, IsArray, IsInt, Max, Min, IsDateString } from 'class-validator';
+import { ApplicationStatus } from '@prisma/client';
+
+export class CreateApplicationDto {
+  @IsString() jobId!: string;
+  @IsString() userId!: string; // Typically taken from auth token; exposed here to keep bundle decoupled
+  @IsEnum(ApplicationStatus) @IsOptional() status?: ApplicationStatus;
+  @IsString() @IsOptional() coverLetter?: string;
+  @IsOptional() tailoredResume?: Record<string, unknown>;
+  @IsInt() @Min(0) @Max(100) @IsOptional() fitScore?: number;
+  @IsArray() @IsString({ each: true }) @IsOptional() keywordMatches?: string[];
+  @IsArray() @IsString({ each: true }) @IsOptional() missingKeywords?: string[];
+  @IsString() @IsOptional() notes?: string;
+  @IsDateString() @IsOptional() interviewDate?: string;
+}
+
+----- /backend/src/modules/applications/dto/update-application.dto.ts -----
+import { PartialType } from '@nestjs/mapped-types';
+import { CreateApplicationDto } from './create-application.dto';
+
+export class UpdateApplicationDto extends PartialType(CreateApplicationDto) {}
+
+----- /backend/src/modules/applications/applications.repository.ts -----
+import { Injectable } from '@nestjs/common';
+import { PrismaService } from '../../prisma/prisma.service';
+import { Prisma } from '@prisma/client';
+
+@Injectable()
+export class ApplicationsRepository {
+  constructor(private prisma: PrismaService) {}
+
+  listByUser(userId: string) {
+    return this.prisma.application.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      include: { job: true },
+    });
+  }
+
+  create(data: Prisma.ApplicationCreateInput) {
+    return this.prisma.application.create({ data, include: { job: true } });
+  }
+
+  update(id: string, data: Prisma.ApplicationUpdateInput) {
+    return this.prisma.application.update({ where: { id }, data, include: { job: true } });
+  }
+
+  get(id: string) {
+    return this.prisma.application.findUnique({ where: { id }, include: { job: true } });
+  }
+
+  addEvent(applicationId: string, type: string, description?: string) {
+    return this.prisma.applicationEvent.create({
+      data: { applicationId, type, description },
+    });
+  }
+}
+
+----- /backend/src/modules/applications/applications.service.ts -----
+import { Injectable, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { ApplicationsRepository } from './applications.repository';
+import { CreateApplicationDto } from './dto/create-application.dto';
+import { UpdateApplicationDto } from './dto/update-application.dto';
+
+type RequestUser = { id: string; role?: string; ageMode?: 'YOUTH' | 'ADULT' | null };
+
+@Injectable()
+export class ApplicationsService {
+  constructor(private repo: ApplicationsRepository) {}
+
+  listMine(user: RequestUser) {
+    if (!user?.id) throw new ForbiddenException();
+    return this.repo.listByUser(user.id);
+  }
+
+  async create(dto: CreateApplicationDto, user: RequestUser) {
+    const userId = user?.id || dto.userId;
+    if (!userId) throw new ForbiddenException();
+    const app = await this.repo.create({
+      job: { connect: { id: dto.jobId } },
+      user: { connect: { id: userId } },
+      status: (dto.status as any) ?? 'SAVED',
+      coverLetter: dto.coverLetter,
+      tailoredResume: (dto.tailoredResume as any) ?? undefined,
+      fitScore: dto.fitScore ?? undefined,
+      keywordMatches: dto.keywordMatches ?? [],
+      missingKeywords: dto.missingKeywords ?? [],
+      notes: dto.notes ?? undefined,
+      interviewDate: dto.interviewDate ? new Date(dto.interviewDate) : undefined,
+    });
+    await this.repo.addEvent(app.id, 'CREATED', 'Application created');
+    return app;
+  }
+
+  async update(id: string, dto: UpdateApplicationDto, user: RequestUser) {
+    const existing = await this.repo.get(id);
+    if (!existing) throw new NotFoundException();
+    if (user?.id && existing.userId !== user.id) throw new ForbiddenException();
+    const updated = await this.repo.update(id, {
+      ...dto,
+      interviewDate: dto.interviewDate ? new Date(dto.interviewDate) : undefined,
+    } as any);
+    await this.repo.addEvent(id, 'UPDATED', 'Application updated');
+    return updated;
+  }
+}
+
+----- /backend/src/modules/applications/applications.controller.ts -----
+import { Controller, Get, Post, Patch, Body, Param, Req } from '@nestjs/common';
+import { ApplicationsService } from './applications.service';
+import { CreateApplicationDto } from './dto/create-application.dto';
+import { UpdateApplicationDto } from './dto/update-application.dto';
+
+@Controller('applications')
+export class ApplicationsController {
+  constructor(private service: ApplicationsService) {}
+
+  @Get('me')
+  listMine(@Req() req: any) {
+    return this.service.listMine(req?.user);
+  }
+
+  @Post()
+  create(@Body() dto: CreateApplicationDto, @Req() req: any) {
+    return this.service.create(dto, req?.user);
+  }
+
+  @Patch(':id')
+  update(@Param('id') id: string, @Body() dto: UpdateApplicationDto, @Req() req: any) {
+    return this.service.update(id, dto, req?.user);
+  }
+}
+
+----- /backend/src/modules/applications/applications.module.ts -----
+import { Module } from '@nestjs/common';
+import { ApplicationsController } from './applications.controller';
+import { ApplicationsService } from './applications.service';
+import { ApplicationsRepository } from './applications.repository';
+import { PrismaService } from '../../prisma/prisma.service';
+
+@Module({
+  controllers: [ApplicationsController],
+  providers: [ApplicationsService, ApplicationsRepository, PrismaService],
+  exports: [ApplicationsService],
+})
+export class ApplicationsModule {}
+
+----- /backend/src/seed/seed-jobs.ts -----
+/**
+ * Seed script to insert a handful of jobs for local testing.
+ * Usage: ts-node src/seed/seed-jobs.ts  (or add an npm script)
+ */
+import { PrismaClient } from '@prisma/client';
+const prisma = new PrismaClient();
+
+async function main() {
+  const jobs = [
+    {
+      title: 'Software Engineer Intern',
+      companyName: 'BlueSky Labs',
+      description: 'Work with TypeScript, React, and Node to build features.',
+      locationType: 'HYBRID',
+      locations: ['San Francisco, CA'],
+      payMin: 38, payMax: 48, payType: 'HOURLY', currency: 'USD',
+      experienceLevel: 'ENTRY',
+      minAge: 16,
+      openToMinors: true,
+      requiredSkills: ['TypeScript', 'React', 'Node.js'],
+      preferredSkills: ['Prisma', 'TailwindCSS'],
+      benefits: ['Mentorship', 'Lunch', 'Laptop'],
+      requirements: ['Basic algorithms', 'Git basics'],
+      verifiedCompany: true,
+      verifiedPay: true,
+      tags: ['software', 'internship', 'frontend'],
+    },
+    {
+      title: 'Data Science Intern',
+      companyName: 'NorthStar Analytics',
+      description: 'Analyze datasets, build simple models, visualize insights.',
+      locationType: 'REMOTE',
+      locations: [],
+      payMin: 30, payMax: 40, payType: 'HOURLY', currency: 'USD',
+      experienceLevel: 'ENTRY',
+      minAge: 18,
+      openToMinors: false,
+      requiredSkills: ['Python', 'Pandas', 'SQL'],
+      preferredSkills: ['scikit-learn', 'Jupyter'],
+      benefits: ['Remote stipend'],
+      requirements: ['Statistics 101'],
+      verifiedCompany: true,
+      verifiedPay: true,
+      tags: ['data', 'remote', 'python'],
+    },
+    {
+      title: 'Marketing Assistant (Part-time)',
+      companyName: 'Aurora Goods',
+      description: 'Help plan campaigns, draft posts, and track metrics.',
+      locationType: 'ONSITE',
+      locations: ['Miami, FL'],
+      payMin: 18, payMax: 22, payType: 'HOURLY', currency: 'USD',
+      experienceLevel: 'ENTRY',
+      minAge: 15,
+      openToMinors: true,
+      requiredSkills: ['Canva', 'Copywriting basics'],
+      preferredSkills: ['Google Analytics'],
+      benefits: ['Store discount'],
+      requirements: ['Good written English'],
+      verifiedCompany: true,
+      verifiedPay: false,
+      tags: ['marketing', 'part-time'],
+    },
+  ] as const;
+
+  for (const data of jobs) {
+    await prisma.job.create({ data: data as any });
+  }
+
+  console.log('Seeded jobs 👍');
+}
+
+main().finally(() => prisma.$disconnect());
+
+----- /backend/src/modules/index.ts (ADD export wires if you use a barrel file) -----
+// export * from './jobs/jobs.module';
+// export * from './applications/applications.module';
+
+----- /web/src/lib/api.ts (ADD or MERGE; minimal HTTP client used by this bundle) -----
+export type HttpOptions = { baseUrl?: string; headers?: Record<string, string> };
+const defaultBase = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+
+async function req<T>(path: string, init?: RequestInit, opts?: HttpOptions): Promise<T> {
+  const res = await fetch(`${opts?.baseUrl ?? defaultBase}${path}`, {
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json', ...(opts?.headers ?? {}) },
+    ...init,
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+
+export const api = {
+  jobs: {
+    list: (params: Record<string, any> = {}) => {
+      const qs = new URLSearchParams(params as any).toString();
+      return req(`/jobs${qs ? `?${qs}` : ''}`);
+    },
+    get: (id: string) => req(`/jobs/${id}`),
+    create: (body: any) => req(`/jobs`, { method: 'POST', body: JSON.stringify(body) }),
+    update: (id: string, body: any) => req(`/jobs/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+    remove: (id: string) => req(`/jobs/${id}`, { method: 'DELETE' }),
+  },
+  applications: {
+    mine: () => req(`/applications/me`),
+    create: (body: any) => req(`/applications`, { method: 'POST', body: JSON.stringify(body) }),
+    update: (id: string, body: any) => req(`/applications/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  }
+};
+
+----- /web/src/entities/all.ts (MERGE; adds Job & Application entity helpers used by your pages) -----
+import { api } from "@/lib/api";
+
+export type Job = {
+  id: string;
+  title: string;
+  companyName: string;
+  description: string;
+  locationType: 'REMOTE' | 'ONSITE' | 'HYBRID';
+  locations: string[];
+  payMin?: number; payMax?: number; payType?: 'HOURLY'|'SALARY'|'STIPEND'; currency?: string;
+  experienceLevel: 'ENTRY'|'JUNIOR'|'MID'|'SENIOR';
+  minAge?: number;
+  openToMinors: boolean;
+  requiredSkills: string[];
+  preferredSkills: string[];
+  benefits: string[];
+  requirements: string[];
+  applicationDeadline?: string;
+  verifiedCompany: boolean;
+  verifiedPay: boolean;
+  tags: string[];
+  externalUrl?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type Application = {
+  id: string;
+  jobId: string;
+  userId: string;
+  status: 'SAVED'|'DRAFTED'|'APPLIED'|'INTERVIEW'|'OFFER'|'REJECTED';
+  coverLetter?: string;
+  tailoredResume?: Record<string, unknown>;
+  fitScore?: number;
+  keywordMatches: string[];
+  missingKeywords: string[];
+  notes?: string;
+  interviewDate?: string;
+  createdAt: string;
+  updatedAt: string;
+  job?: Job;
+};
+
+export const JobEntity = {
+  list: (orderBy: string = '-created_date', limit = 50) => api.jobs.list({ limit, orderBy: orderBy === '-created_date' ? '-createdAt' : 'createdAt' }) as Promise<Job[]>,
+  get: (id: string) => api.jobs.get(id) as Promise<Job>,
+};
+
+export const ApplicationEntity = {
+  filterMine: () => api.applications.mine() as Promise<Application[]>,
+  create: (payload: Partial<Application> & { jobId: string }) => api.applications.create(payload) as Promise<Application>,
+  update: (id: string, payload: Partial<Application>) => api.applications.update(id, payload) as Promise<Application>,
+};
+
+// NOTE: We assume you already have a User.me() in your codebase.
+// If not, stub minimally:
+export const User = {
+  async me(): Promise<{ id: string; full_name?: string; age_mode?: 'YOUTH'|'ADULT'; skills?: string[]; ready_score?: number; }> {
+    // Replace with real call to your /me endpoint
+    const fallback = { id: 'demo-user', full_name: 'Demo User', age_mode: 'ADULT' as const, skills: ['React','TypeScript'], ready_score: 75 };
+    try {
+      const res = await fetch((import.meta as any).env?.VITE_API_URL ? `${(import.meta as any).env.VITE_API_URL}/me` : 'http://localhost:3000/me', { credentials: 'include' });
+      if (!res.ok) return fallback as any;
+      return await res.json();
+    } catch {
+      return fallback as any;
+    }
+  }
+};
+
+----- /web/src/pages/JobsPage.tsx (REPLACE/ADD — wired to API; safe-mode aware) -----
+import React, { useEffect, useMemo, useState } from "react";
+import { JobEntity as Job, ApplicationEntity as Application, User } from "@/entities/all";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  BriefcaseIcon,
+  MapPinIcon,
+  DollarSignIcon,
+  ClockIcon,
+  StarIcon,
+  FilterIcon,
+  SearchIcon,
+  SparklesIcon,
+  ShieldCheckIcon,
+  ArrowRightIcon
+} from "lucide-react";
+import { motion, AnimatePresence } from "framer-motion";
+
+type FEJob = Awaited<ReturnType<typeof Job.list>>[number];
+
+const JobCard = ({ job, onApply, currentUser }: { job: FEJob, onApply: (job: FEJob)=>Promise<void>, currentUser: any }) => {
+  const [isApplying, setIsApplying] = useState(false);
+  const handleApply = async () => {
+    setIsApplying(true);
+    try { await onApply(job); } finally { setIsApplying(false); }
+  };
+  const fitScore = useMemo(() => {
+    const userSkills = (currentUser?.skills || []).map((s:string)=>s.toLowerCase());
+    const req = (job.requiredSkills || []).map((s:string)=>s.toLowerCase());
+    const matches = req.filter((s:string)=> userSkills.some((u:string)=> u.includes(s) || s.includes(u)));
+    return Math.min(95, Math.floor((matches.length / Math.max(1, req.length)) * 100)) || 72;
+  }, [currentUser, job]);
+
+  return (
+    <motion.div initial={{ opacity:0, y:20 }} animate={{ opacity:1, y:0 }} whileHover={{ y:-4, scale:1.02 }} transition={{ duration:0.2 }} className="group">
+      <Card className="h-full bg-white/90 backdrop-blur-sm border border-gray-200/60 shadow-lg hover:shadow-2xl transition-all duration-300 group-hover:border-indigo-300">
+        <CardHeader className="pb-4">
+          <div className="flex items-start justify-between">
+            <div className="flex-1">
+              <div className="flex items-center gap-2 mb-2">
+                <CardTitle className="text-xl font-bold text-gray-900 group-hover:text-indigo-700 transition-colors">
+                  {job.title}
+                </CardTitle>
+                {job.verifiedCompany && (<ShieldCheckIcon className="w-5 h-5 text-emerald-500" />)}
+              </div>
+              <p className="text-lg text-gray-700 font-semibold">{job.companyName}</p>
+              <div className="flex items-center gap-4 mt-3 text-sm text-gray-600">
+                <div className="flex items-center gap-1">
+                  <MapPinIcon className="w-4 h-4" /><span>{job.locationType === "REMOTE" ? "Remote" : job.locations?.[0]}</span>
+                </div>
+                {typeof job.payMin === 'number' && (
+                  <div className="flex items-center gap-1">
+                    <DollarSignIcon className="w-4 h-4" />
+                    <span>${job.payMin.toLocaleString()}{typeof job.payMax === 'number' ? ` - $${job.payMax.toLocaleString()}` : "+"}</span>
+                  </div>
+                )}
+                <div className="flex items-center gap-1">
+                  <ClockIcon className="w-4 h-4" /><span>{job.payType ?? '—'}</span>
+                </div>
+              </div>
+            </div>
+            <div className="flex flex-col items-center">
+              <div className="flex items-center gap-1 mb-1">
+                <StarIcon className="w-4 h-4 text-yellow-500 fill-current" />
+                <span className="text-sm font-semibold text-gray-700">{fitScore}%</span>
+              </div>
+              <span className="text-xs text-gray-500">Match</span>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="pt-0">
+          <div className="space-y-4">
+            <p className="text-gray-600 text-sm line-clamp-3">{job.description?.substring(0, 200)}...</p>
+            <div className="flex flex-wrap gap-2">
+              {job.verifiedCompany && (<Badge className="bg-emerald-100 text-emerald-800 border-emerald-200">Verified Employer</Badge>)}
+              {job.openToMinors && currentUser?.age_mode === 'YOUTH' && (<Badge className="bg-blue-100 text-blue-800 border-blue-200">Youth-Friendly</Badge>)}
+              <Badge variant="outline" className="text-xs">{job.experienceLevel}</Badge>
+              {job.locationType === "REMOTE" && (<Badge className="bg-purple-100 text-purple-800 border-purple-200">Remote OK</Badge>)}
+            </div>
+            <div className="flex items-center justify-between pt-3 border-t border-gray-100">
+              <div className="text-xs text-gray-500">Posted {new Date(job.createdAt).toLocaleDateString()}</div>
+              <Button size="sm" className="bg-gradient-to-r from-indigo-500 to-indigo-600 hover:from-indigo-600 hover:to-indigo-700 text-white shadow-md hover:shadow-lg transition-all duration-200 group-hover:scale-105" onClick={handleApply} disabled={isApplying}>
+                {isApplying ? "Applying..." : <>Apply Now<ArrowRightIcon className="w-4 h-4 ml-1" /></>}
+              </Button>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+    </motion.div>
+  );
+};
+
+const FilterPanel = ({ filters, onFilterChange, currentUser }: any) => (
+  <Card className="bg-white/90 backdrop-blur-sm border border-gray-200/60 shadow-lg">
+    <CardHeader><CardTitle className="flex items-center gap-2 text-lg"><FilterIcon className="w-5 h-5 text-indigo-600" />Filters</CardTitle></CardHeader>
+    <CardContent className="space-y-4">
+      <div>
+        <label className="text-sm font-medium text-gray-700 mb-2 block">Experience Level</label>
+        <Select value={filters.experience} onValueChange={(value) => onFilterChange({ ...filters, experience: value })}>
+          <SelectTrigger><SelectValue placeholder="Any level" /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">Any level</SelectItem>
+            <SelectItem value="ENTRY">Entry Level</SelectItem>
+            <SelectItem value="JUNIOR">Junior</SelectItem>
+            <SelectItem value="MID">Mid Level</SelectItem>
+            <SelectItem value="SENIOR">Senior</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+      <div>
+        <label className="text-sm font-medium text-gray-700 mb-2 block">Location Type</label>
+        <Select value={filters.location} onValueChange={(value) => onFilterChange({ ...filters, location: value })}>
+          <SelectTrigger><SelectValue placeholder="Any location" /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">Any location</SelectItem>
+            <SelectItem value="REMOTE">Remote</SelectItem>
+            <SelectItem value="ONSITE">On-site</SelectItem>
+            <SelectItem value="HYBRID">Hybrid</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+      <div>
+        <label className="text-sm font-medium text-gray-700 mb-2 block">Pay Type</label>
+        <Select value={filters.payType} onValueChange={(value) => onFilterChange({ ...filters, payType: value })}>
+          <SelectTrigger><SelectValue placeholder="Any pay type" /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">Any</SelectItem>
+            <SelectItem value="SALARY">Salary</SelectItem>
+            <SelectItem value="HOURLY">Hourly</SelectItem>
+            <SelectItem value="STIPEND">Stipend</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+      <div className="space-y-3">
+        <div className="flex items-center space-x-2">
+          <Checkbox id="verified" checked={filters.verifiedOnly} onCheckedChange={(checked) => onFilterChange({ ...filters, verifiedOnly: !!checked })} />
+          <label htmlFor="verified" className="text-sm font-medium text-gray-700 cursor-pointer">Verified employers only</label>
+        </div>
+        {currentUser?.age_mode === 'YOUTH' && (
+          <div className="flex items-center space-x-2">
+            <Checkbox id="youth-friendly" checked={filters.youthFriendly} onCheckedChange={(checked) => onFilterChange({ ...filters, youthFriendly: !!checked })} />
+            <label htmlFor="youth-friendly" className="text-sm font-medium text-gray-700 cursor-pointer">Youth-friendly positions</label>
+          </div>
+        )}
+      </div>
+      <Button variant="outline" className="w-full" onClick={() => onFilterChange({ search: '', experience: 'all', location: 'all', payType: 'all', verifiedOnly: false, youthFriendly: false })}>Clear All Filters</Button>
+    </CardContent>
+  </Card>
+);
+
+export default function JobsPage() {
+  const [jobs, setJobs] = useState<FEJob[]>([]);
+  const [currentUser, setCurrentUser] = useState<any>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [filters, setFilters] = useState<any>({ search: '', experience: 'all', location: 'all', payType: 'all', verifiedOnly: false, youthFriendly: false });
+
+  useEffect(() => { (async () => {
+    setIsLoading(true);
+    const [u, j] = await Promise.all([User.me(), Job.list('-created_date', 50)]);
+    setCurrentUser(u); setJobs(j); setIsLoading(false);
+  })(); }, []);
+
+  const handleApplyToJob = async (job: FEJob) => {
+    await Application.create({ jobId: job.id, status: 'SAVED' } as any);
+    alert("Job saved! Continue in Applications.");
+  };
+
+  const filtered = jobs.filter((job) => {
+    const s = filters.search?.toLowerCase?.() || '';
+    const matchesSearch = !s || job.title.toLowerCase().includes(s) || job.companyName.toLowerCase().includes(s) || job.description.toLowerCase().includes(s);
+    const matchesExperience = filters.experience === 'all' || job.experienceLevel === filters.experience;
+    const matchesLocation = filters.location === 'all' || job.locationType === filters.location;
+    const matchesPayType = filters.payType === 'all' || job.payType === filters.payType;
+    const matchesVerified = !filters.verifiedOnly || job.verifiedCompany;
+    const matchesYouth = !filters.youthFriendly || job.openToMinors;
+    return matchesSearch && matchesExperience && matchesLocation && matchesPayType && matchesVerified && matchesYouth;
+  });
+
+  if (isLoading) return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 via-white to-blue-50 p-6 md:p-8">
+      <div className="max-w-7xl mx-auto">
+        <div className="animate-pulse space-y-6">
+          <div className="h-8 bg-gray-200 rounded w-64"></div>
+          <div className="grid lg:grid-cols-4 gap-6">
+            <div className="h-96 bg-gray-200 rounded-lg"></div>
+            <div className="lg:col-span-3 grid gap-6">
+              {Array.from({length:6}).map((_,i)=>(<div key={i} className="h-64 bg-gray-200 rounded-lg"></div>))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 via-white to-blue-50 p-6 md:p-8">
+      <div className="max-w-7xl mx-auto">
+        <motion.div initial={{ opacity:0, y:-20 }} animate={{ opacity:1, y:0 }} className="mb-8">
+          <h1 className="text-3xl md:text-4xl font-bold text-gray-900 mb-2">Find Your Perfect Job</h1>
+          <p className="text-gray-600">Discover opportunities from verified employers 
+            {currentUser?.age_mode === 'YOUTH' && (<span className="inline-flex items-center gap-2 ml-2 px-3 py-1 bg-emerald-100 text-emerald-800 rounded-full text-sm font-medium"><SparklesIcon className="w-4 h-4" />Youth-Safe Mode</span>)}
+          </p>
+        </motion.div>
+
+        <motion.div initial={{ opacity:0, y:20 }} animate={{ opacity:1, y:0 }} transition={{ delay:0.1 }} className="mb-8">
+          <div className="relative">
+            <SearchIcon className="absolute left-4 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
+            <Input placeholder="Search jobs, companies, or skills..." className="pl-12 h-14 text-lg bg-white/90 backdrop-blur-sm border-gray-200/60 shadow-lg focus:shadow-xl focus:border-indigo-300 transition-all duration-200" value={filters.search} onChange={(e) => setFilters({ ...filters, search: e.target.value })} />
+          </div>
+        </motion.div>
+
+        <div className="grid lg:grid-cols-4 gap-8">
+          <motion.div initial={{ opacity:0, x:-20 }} animate={{ opacity:1, x:0 }} transition={{ delay:0.2 }}>
+            <FilterPanel filters={filters} onFilterChange={setFilters} currentUser={currentUser} />
+          </motion.div>
+
+          <div className="lg:col-span-3">
+            <motion.div initial={{ opacity:0 }} animate={{ opacity:1 }} transition={{ delay:0.3 }} className="mb-6 flex items-center justify-between">
+              <p className="text-gray-600">Showing {filtered.length} jobs{filters.search && (<span className="font-medium"> for "{filters.search}"</span>)}</p>
+            </motion.div>
+
+            <AnimatePresence>
+              <div className="grid gap-6">
+                {filtered.map((job, index) => (
+                  <motion.div key={job.id} initial={{ opacity:0, y:20 }} animate={{ opacity:1, y:0 }} transition={{ delay:0.05 * index }}>
+                    <JobCard job={job} onApply={handleApplyToJob} currentUser={currentUser} />
+                  </motion.div>
+                ))}
+              </div>
+            </AnimatePresence>
+
+            {filtered.length === 0 && (
+              <motion.div initial={{ opacity:0 }} animate={{ opacity:1 }} className="text-center py-16">
+                <BriefcaseIcon className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+                <h3 className="text-xl font-semibold text-gray-600 mb-2">No jobs found</h3>
+                <p className="text-gray-500 mb-6">Try adjusting your search criteria or filters</p>
+                <Button variant="outline" onClick={() => setFilters({ search: '', experience: 'all', location: 'all', payType: 'all', verifiedOnly: false, youthFriendly: false })}>Clear All Filters</Button>
+              </motion.div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+----- /web/src/pages/ApplicationsPage.tsx (REPLACE/ADD — wired to API) -----
+import React, { useEffect, useState } from "react";
+import { ApplicationEntity as Application } from "@/entities/all";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { 
+  BriefcaseIcon, 
+  ClockIcon, 
+  CheckCircleIcon, 
+  XCircleIcon,
+  CalendarIcon,
+  MapPinIcon,
+  DollarSignIcon,
+  StarIcon,
+  EditIcon,
+  ExternalLinkIcon
+} from "lucide-react";
+import { motion, AnimatePresence } from "framer-motion";
+
+const StatusBadge = ({ status }: { status: string }) => {
+  const map: Record<string, any> = {
+    SAVED: { color: "bg-gray-100 text-gray-800", Icon: BriefcaseIcon },
+    DRAFTED: { color: "bg-blue-100 text-blue-800", Icon: EditIcon },
+    APPLIED: { color: "bg-indigo-100 text-indigo-800", Icon: CheckCircleIcon },
+    INTERVIEW: { color: "bg-yellow-100 text-yellow-800", Icon: CalendarIcon },
+    OFFER: { color: "bg-emerald-100 text-emerald-800", Icon: CheckCircleIcon },
+    REJECTED: { color: "bg-red-100 text-red-800", Icon: XCircleIcon }
+  };
+  const cfg = map[status] || map.SAVED;
+  const Ico = cfg.Icon;
+  return <Badge className={`${cfg.color} border-0 flex items-center gap-1`}><Ico className="w-3 h-3" />{status.replace('_',' ')}</Badge>;
+};
+
+export default function ApplicationsPage() {
+  const [applications, setApplications] = useState<any[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState("all");
+
+  useEffect(() => { (async () => {
+    setIsLoading(true);
+    const data = await Application.filterMine();
+    setApplications(data);
+    setIsLoading(false);
+  })(); }, []);
+
+  const updateStatus = async (id: string, status: string) => {
+    await Application.update(id, { status });
+    const data = await Application.filterMine();
+    setApplications(data);
+  };
+
+  const filtered = applications.filter(a => activeTab === 'all' ? true : a.status === activeTab);
+
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-gray-50 via-white to-blue-50 p-6 md:p-8">
+        <div className="max-w-6xl mx-auto">
+          <div className="animate-pulse space-y-6">
+            <div className="h-8 bg-gray-200 rounded w-64"></div>
+            <div className="h-12 bg-gray-200 rounded w-full"></div>
+            <div className="grid gap-6">
+              {Array.from({length:4}).map((_,i)=>(<div key={i} className="h-48 bg-gray-200 rounded-lg"></div>))}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 via-white to-blue-50 p-6 md:p-8">
+      <div className="max-w-6xl mx-auto">
+        <motion.div initial={{ opacity:0, y:-20 }} animate={{ opacity:1, y:0 }} className="mb-8">
+          <h1 className="text-3xl md:text-4xl font-bold text-gray-900 mb-2">My Applications</h1>
+          <p className="text-gray-600">Track your job applications and their progress</p>
+        </motion.div>
+
+        <motion.div initial={{ opacity:0, y:20 }} animate={{ opacity:1, y:0 }} transition={{ delay:0.1 }} className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-8">
+          {[
+            { label: "Total", count: applications.length },
+            { label: "Applied", count: applications.filter(a=>a.status==='APPLIED').length },
+            { label: "Interviews", count: applications.filter(a=>a.status==='INTERVIEW').length },
+            { label: "Offers", count: applications.filter(a=>a.status==='OFFER').length },
+            { label: "Rejected", count: applications.filter(a=>a.status==='REJECTED').length },
+          ].map((s)=>(
+            <Card key={s.label} className="bg-white/80 backdrop-blur-sm border border-gray-200/60">
+              <CardContent className="p-4 text-center">
+                <div className="text-2xl font-bold text-gray-900">{s.count}</div>
+                <div className="text-sm text-gray-600">{s.label}</div>
+              </CardContent>
+            </Card>
+          ))}
+        </motion.div>
+
+        <motion.div initial={{ opacity:0, y:20 }} animate={{ opacity:1, y:0 }} transition={{ delay:0.2 }}>
+          <Tabs value={activeTab} onValueChange={setActiveTab} className="mb-6">
+            <TabsList className="bg-white/90 backdrop-blur-sm border border-gray-200/60 shadow-md">
+              <TabsTrigger value="all">All</TabsTrigger>
+              <TabsTrigger value="SAVED">Saved</TabsTrigger>
+              <TabsTrigger value="APPLIED">Applied</TabsTrigger>
+              <TabsTrigger value="INTERVIEW">Interview</TabsTrigger>
+              <TabsTrigger value="OFFER">Offers</TabsTrigger>
+              <TabsTrigger value="REJECTED">Rejected</TabsTrigger>
+            </TabsList>
+            <TabsContent value={activeTab} />
+          </Tabs>
+        </motion.div>
+
+        <AnimatePresence>
+          {filtered.length > 0 ? (
+            <motion.div initial={{ opacity:0 }} animate={{ opacity:1 }} className="grid gap-6">
+              {filtered.map((application: any, index: number) => (
+                <motion.div key={application.id} initial={{ opacity:0, y:20 }} animate={{ opacity:1, y:0 }} transition={{ delay:0.05 * index }}>
+                  <Card className="bg-white/90 backdrop-blur-sm border border-gray-200/60 shadow-md hover:shadow-lg transition-all duration-300">
+                    <CardHeader className="pb-4">
+                      <div className="flex items-start justify-between">
+                        <div className="flex-1">
+                          <CardTitle className="text-lg font-bold text-gray-900 mb-1">
+                            {application.job?.title ?? "Job"}
+                          </CardTitle>
+                          <p className="text-gray-600 font-medium">{application.job?.companyName ?? "Company"}</p>
+                          <div className="flex items-center gap-4 mt-2 text-sm text-gray-500">
+                            <div className="flex items-center gap-1"><MapPinIcon className="w-4 h-4" /><span>{application.job?.locationType === "REMOTE" ? "Remote" : application.job?.locations?.[0]}</span></div>
+                            {typeof application.job?.payMin === 'number' && (
+                              <div className="flex items-center gap-1"><DollarSignIcon className="w-4 h-4" />
+                                <span>${application.job.payMin.toLocaleString()}{typeof application.job.payMax === 'number' ? ` - $${application.job.payMax.toLocaleString()}` : "+"}</span>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                        <div className="flex flex-col items-end gap-2">
+                          <StatusBadge status={application.status} />
+                          {typeof application.fitScore === 'number' && (
+                            <div className="flex items-center gap-1"><StarIcon className="w-4 h-4 text-yellow-500 fill-current" /><span className="text-sm font-medium text-gray-700">{application.fitScore}%</span></div>
+                          )}
+                        </div>
+                      </div>
+                    </CardHeader>
+                    <CardContent className="pt-0">
+                      <div className="space-y-4">
+                        <div className="flex items-center justify-between text-xs text-gray-500">
+                          <span>Applied {new Date(application.createdAt).toLocaleDateString()}</span>
+                          {application.interviewDate && (<span className="flex items-center gap-1 text-yellow-600 font-medium"><CalendarIcon className="w-3 h-3" />Interview {new Date(application.interviewDate).toLocaleDateString()}</span>)}
+                        </div>
+                        {application.notes && (<div className="p-3 bg-gray-50 rounded-lg"><p className="text-sm text-gray-700">{application.notes}</p></div>)}
+                        <div className="flex items-center justify-between pt-3 border-t border-gray-100">
+                          <div className="flex gap-2">
+                            {application.status === "SAVED" && (<Button size="sm" variant="outline" onClick={() => updateStatus(application.id, "APPLIED")}>Mark Applied</Button>)}
+                            {application.status === "APPLIED" && (<Button size="sm" variant="outline" onClick={() => updateStatus(application.id, "INTERVIEW")}>Got Interview</Button>)}
+                            {application.status === "INTERVIEW" && (<Button size="sm" variant="outline" onClick={() => updateStatus(application.id, "OFFER")}>Got Offer</Button>)}
+                          </div>
+                          {application.job?.externalUrl && (<Button size="sm" variant="ghost"><ExternalLinkIcon className="w-4 h-4 mr-1" />View Job</Button>)}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                </motion.div>
+              ))}
+            </motion.div>
+          ) : (
+            <motion.div initial={{ opacity:0 }} animate={{ opacity:1 }} className="text-center py-16">
+              <BriefcaseIcon className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+              <h3 className="text-xl font-semibold text-gray-600 mb-2">
+                {activeTab === "all" ? "No applications yet" : `No ${activeTab.toLowerCase()} applications`}
+              </h3>
+              <p className="text-gray-500 mb-6">
+                {activeTab === "all" ? "Start exploring job opportunities and apply to positions that interest you" : `You don't have any applications in the ${activeTab.toLowerCase()} status`}
+              </p>
+              {activeTab === "all" && (<Button className="bg-gradient-to-r from-indigo-500 to-indigo-600 hover:from-indigo-600 hover:to-indigo-700 text-white">Browse Jobs</Button>)}
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+    </div>
+  );
+}
+
+----- /web/src/routes/jobs.ts (ADD to your router setup if you use route modules) -----
+// import JobsPage from "@/pages/JobsPage";
+// export const jobsRoute = { path: "/jobs", element: <JobsPage /> };
+
+----- /web/src/routes/applications.ts (ADD) -----
+// import ApplicationsPage from "@/pages/ApplicationsPage";
+// export const applicationsRoute = { path: "/applications", element: <ApplicationsPage /> };
+
+----- /shared/contracts/job.ts (OPTIONAL ADD) -----
+export type JobContract = {
+  id: string;
+  title: string;
+  companyName: string;
+  // ...keep in sync with FE type
+};
+
+----- /shared/contracts/application.ts (OPTIONAL ADD) -----
+export type ApplicationContract = {
+  id: string;
+  jobId: string;
+  userId: string;
+  status: 'SAVED'|'DRAFTED'|'APPLIED'|'INTERVIEW'|'OFFER'|'REJECTED';
+};
+
+----- /ops/README-BUNDLE-03.md -----
+# Bundle 03 — Jobs & Applications
+
+## DB
+- Adds `Job`, `Application`, `ApplicationEvent` models and enums
+- Enforces youth-mode filtering on server
+
+## API
+- `GET /jobs` with filters: search, experience, location, payType, verifiedOnly, youthFriendly, limit, orderBy
+- `GET /jobs/:id`
+- `POST /jobs`, `PATCH /jobs/:id`, `DELETE /jobs/:id` (basic checks for youth settings)
+- `GET /applications/me`
+- `POST /applications`
+- `PATCH /applications/:id`
+
+## Web
+- Jobs page: search + filters, youth badge, fit score, apply
+- Applications page: status tabs and quick transitions
+
+## Seed
+- Run `ts-node src/seed/seed-jobs.ts` to insert sample jobs
+
+## Next bundles
+- Resume builder + tailoring
+- Messaging + inbox
+- Feed + posts + comments
+- Employer dashboards & job posting workflow
+- AI coach endpoints (no keys in code)
+
