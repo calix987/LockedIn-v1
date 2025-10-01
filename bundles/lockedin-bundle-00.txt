@@ -1,280 +1,31 @@
------ /.env.example -----
-# root env placeholder
-
------ /.gitignore -----
-node_modules
-.next
-out
-dist
-.vercel
-.env
-*.env
-*.local
-logs
-*.log
-apps/api/prisma/dev.db
-apps/api/prisma/dev.db-journal
-.DS_Store
-Thumbs.db
-
------ /README.md -----
-# LockedIn — Monorepo Skeleton (Bundle 00)
-
-Foundation for the app: web (Next.js), API (Express+Prisma), shared packages, and local infra.
-Secrets are excluded. Use `*.env.example` to create your local `.env` files.
-
------ /package.json -----
+===FILE: web/package.json
 {
-  "name": "lockedin",
+  "name": "lockedin-web",
   "private": true,
-  "version": "0.0.0",
   "scripts": {
-    "dev": "concurrently -k -n web,api -c cyan,magenta \"pnpm --filter @lockedin/web dev\" \"pnpm --filter @lockedin/api dev\"",
-    "build": "pnpm -r build",
-    "start": "pnpm --filter @lockedin/web start"
-  },
-  "devDependencies": {
-    "concurrently": "^8.2.2",
-    "turbo": "^2.0.4",
-    "typescript": "^5.5.4"
-  },
-  "packageManager": "pnpm@8.15.4"
-}
-
------ /pnpm-workspace.yaml -----
-packages:
-  - "apps/*"
-  - "packages/*"
-
------ /tsconfig.base.json -----
-{
-  "compilerOptions": {
-    "target": "ES2022",
-    "lib": [
-      "ES2022",
-      "DOM"
-    ],
-    "module": "ESNext",
-    "moduleResolution": "Bundler",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "paths": {
-      "@lockedin/types": [
-        "packages/types/src/index.ts"
-      ],
-      "@lockedin/ui": [
-        "packages/ui/src/index.ts"
-      ]
-    }
-  }
-}
-
------ /turbo.json -----
-{
-  "$schema": "https://turbo.build/schema.json",
-  "pipeline": {
-    "dev": {
-      "cache": false
-    }
-  }
-}
-
------ /infra/docker-compose.yml -----
-version: "3.9"
-services:
-  db:
-    image: postgres:16
-    environment:
-      POSTGRES_USER: lockedin
-      POSTGRES_PASSWORD: lockedin
-      POSTGRES_DB: lockedin
-    ports:
-      - "5432:5432"
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-
------ /packages/types/package.json -----
-{
-  "name": "@lockedin/types",
-  "version": "0.0.0",
-  "private": true,
-  "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "scripts": {
-    "build": "tsc -p tsconfig.json"
-  }
-}
-
------ /packages/types/tsconfig.json -----
-{
-  "extends": "../../tsconfig.base.json",
-  "compilerOptions": {
-    "outDir": "dist",
-    "declaration": true
-  },
-  "include": [
-    "src"
-  ]
-}
-
------ /packages/types/src/index.ts -----
-export type UUID = string;
-export interface User { id: UUID; email: string; full_name?: string; }
-export interface Job { id: UUID; title: string; company: string; }
-export type ApplicationStatus = 'SAVED' | 'APPLIED' | 'INTERVIEW' | 'OFFER' | 'REJECTED';
-export interface Application { id: UUID; job_id: UUID; user_id: UUID; status: ApplicationStatus; }
-
------ /packages/ui/package.json -----
-{
-  "name": "@lockedin/ui",
-  "version": "0.0.0",
-  "private": true,
-  "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "scripts": {
-    "build": "tsc -p tsconfig.json"
-  },
-  "peerDependencies": {
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000"
   },
   "dependencies": {
-    "clsx": "^2.1.1"
-  }
-}
-
------ /packages/ui/tsconfig.json -----
-{
-  "extends": "../../tsconfig.base.json",
-  "compilerOptions": {
-    "outDir": "dist",
-    "jsx": "react-jsx",
-    "declaration": true
-  },
-  "include": [
-    "src"
-  ]
-}
-
------ /packages/ui/src/index.ts -----
-export * from './primitives';
-
------ /packages/ui/src/primitives.tsx -----
-export const Button=()=>null; export const Card=()=>null; export const Badge=()=>null;
-
------ /apps/web/.env.example -----
-NEXT_PUBLIC_API_BASE_URL=http://localhost:4000
-
------ /apps/web/next-env.d.ts -----
-/// <reference types="next" />
-/// <reference types="next/image-types/global" />
-
------ /apps/web/next.config.mjs -----
-export default { reactStrictMode: true, env: { NEXT_PUBLIC_API_BASE_URL: process.env.NEXT_PUBLIC_API_BASE_URL } };
-
------ /apps/web/package.json -----
-{
-  "name": "@lockedin/web",
-  "version": "0.0.0",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "dev": "next dev -p 3000"
-  },
-  "dependencies": {
-    "@lockedin/types": "workspace:*",
-    "@lockedin/ui": "workspace:*",
-    "next": "14.2.4",
+    "next": "14.2.5",
     "react": "18.2.0",
     "react-dom": "18.2.0"
   }
 }
-
------ /apps/web/tsconfig.json -----
-{
-  "extends": "../../tsconfig.base.json",
-  "compilerOptions": {
-    "baseUrl": ".",
-    "paths": {
-      "@/*": [
-        "./*"
-      ]
-    }
-  },
-  "include": [
-    "next-env.d.ts",
-    "**/*.ts",
-    "**/*.tsx"
-  ],
-  "exclude": [
-    "node_modules"
-  ]
+===END===
+===FILE: web/pages/index.js
+export default function Home() {
+  return (
+    <main style={{ padding: 24, fontFamily: "system-ui, sans-serif" }}>
+      <h1>LockedIn</h1>
+      <p>Pipeline works 🎉 — this page was generated from a bundle.</p>
+    </main>
+  );
 }
-
------ /apps/web/app/layout.tsx -----
-export default function RootLayout({children}:{children:React.ReactNode}){return(<html lang='en'><body>{children}</body></html>)}
-
------ /apps/web/app/page.tsx -----
-export default function Home(){return(<main className='p-8'>LockedIn Bundle 00</main>)}
-
------ /apps/api/.env.example -----
-PORT=4000
-DATABASE_URL=postgresql://lockedin:lockedin@localhost:5432/lockedin?schema=public
-CORS_ORIGIN=http://localhost:3000
-JWT_SECRET=replace_me_locally
-NODE_ENV=development
-
------ /apps/api/package.json -----
-{
-  "name": "@lockedin/api",
-  "version": "0.0.0",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "dev": "ts-node-dev --respawn --transpile-only src/index.ts"
-  },
-  "dependencies": {
-    "@prisma/client": "^5.19.0",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "helmet": "^7.1.0",
-    "morgan": "^1.10.0",
-    "zod": "^3.23.8"
-  },
-  "devDependencies": {
-    "ts-node-dev": "^2.0.0",
-    "typescript": "^5.5.4",
-    "prisma": "^5.19.0",
-    "@types/node": "^20.11.30",
-    "@types/express": "^4.17.21"
-  }
-}
-
------ /apps/api/tsconfig.json -----
-{
-  "extends": "../../tsconfig.base.json",
-  "compilerOptions": {
-    "outDir": "dist"
-  },
-  "include": [
-    "src"
-  ]
-}
-
------ /apps/api/src/env.ts -----
-export const loadEnv=()=>({PORT:process.env.PORT||'4000'} as const);
-
------ /apps/api/src/index.ts -----
-import express from 'express'; import {loadEnv} from './env'; const app=express(); const {PORT}=loadEnv(); app.get('/health',(_,res)=>res.json({ok:true})); app.listen(Number(PORT));
-
------ /apps/api/prisma/schema.prisma -----
-generator client{provider="prisma-client-js"}
-datasource db{provider="postgresql" url=env("DATABASE_URL")}
-model User{ id String @id @default(cuid()) email String @unique createdAt DateTime @default(now()) }
-
+===END===
+===FILE: web/README.md
+# LockedIn (test)
+This tiny Next.js app is here only to verify the bundle → files → commit pipeline.
+Once confirmed, replace with the real app files from your full bundles.
+===END===
