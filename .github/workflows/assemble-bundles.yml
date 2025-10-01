@@ -1,12 +1,11 @@
-# .github/workflows/assemble-bundles.yml
 name: Assemble Bundles
 
 on:
   push:
     paths:
-      - 'bundles/**/*.txt'
-      - 'scripts/expand-bundles.mjs'
-      - '.github/workflows/assemble-bundles.yml'
+      - "bundles/**.txt"
+      - ".github/workflows/assemble-bundles.yml"
+      - "scripts/expand-bundles.mjs"
   workflow_dispatch:
 
 jobs:
@@ -14,23 +13,28 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
       - name: Ensure bundles dir (ok if missing)
-        run: mkdir -p bundles
+        run: |
+          if [ ! -d bundles ]; then
+            echo "No /bundles folder; nothing to assemble."
+            echo "SKIP_ASSEMBLE=true" >> $GITHUB_ENV
+          fi
 
       - name: Assemble (only if bundles exist)
-        if: ${{ hashFiles('bundles/**/*.txt') != '' }}
+        if: env.SKIP_ASSEMBLE != 'true'
         run: node scripts/expand-bundles.mjs
 
       - name: Commit assembled files
-        if: ${{ hashFiles('bundles/**/*.txt') != '' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
