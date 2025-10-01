@@ -1,25 +1,31 @@
 // scripts/expand-bundles.mjs
-// Expands "bundle" .txt files into real repo files.
-// Each bundle uses markers:
-//   ===FILE: relative/path/to/file.ext
-//   ...file contents...
-//   ===END===
-//
-// Example:
-// ===FILE: apps/web/src/app/page.tsx
-// import React from "react";
-// export default function Page(){ return <div/> }
-// ===END===
-
 import fs from "node:fs";
 import path from "node:path";
 
-const BUNDLES_DIR = path.resolve(process.cwd(), "bundles");
+const ROOT = process.cwd();
+const BUNDLES_DIR = path.resolve(ROOT, "bundles");
 const FILE_START = "===FILE:";
 const FILE_END = "===END===";
 
-function ensureDir(filePath) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+function ensureDirFor(p) {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+}
+
+function cleanRelPath(input) {
+  let rel = String(input || "").trim();
+
+  // drop leading "./" or "/" (so paths are repo-relative)
+  rel = rel.replace(/^\.?\//, "");
+
+  // drop any leftover "===" or stray "=" from filenames
+  rel = rel.replace(/[=]+$/, "");
+
+  // normalize to posix separators and prevent path escape
+  rel = rel.replace(/\\/g, "/");
+  rel = path.posix.normalize(rel);
+  while (rel.startsWith("../")) rel = rel.slice(3);
+
+  return rel;
 }
 
 function expandBundle(filePath) {
@@ -32,69 +38,58 @@ function expandBundle(filePath) {
 
   while (i < lines.length) {
     if (lines[i].startsWith(FILE_START)) {
-      // Get relative path after marker and normalize it
-      const rel = lines[i]
-        .slice(FILE_START.length)
-        .trim()
-        .replace(/^[./\\]+/, ""); // strip ./ or .\ or leading slashes
+      const rawRel = lines[i].slice(FILE_START.length);
+      const rel = cleanRelPath(rawRel);
 
       let j = i + 1;
       const buf = [];
-
-      // Gather until FILE_END (or EOF)
       while (j < lines.length && lines[j].trim() !== FILE_END) {
         buf.push(lines[j]);
         j++;
       }
 
       if (j >= lines.length) {
-        console.warn(`⚠️  Missing ${FILE_END} after "${rel}" in ${name}. Writing what we have.`);
+        console.warn(`⚠️  Missing ${FILE_END} after ${rel} in ${name}`);
+        break;
       }
 
-      const dest = path.resolve(process.cwd(), rel);
-      ensureDir(dest);
-
-      // Ensure trailing newline for prettier diffs
-      const contents = buf.join("\n") + "\n";
-      fs.writeFileSync(dest, contents, "utf8");
+      const dest = path.resolve(ROOT, rel);
+      ensureDirFor(dest);
+      fs.writeFileSync(dest, buf.join("\n"), "utf8");
       created.push(rel);
 
-      // Move past the END marker if it was found
-      i = j < lines.length ? j + 1 : j;
+      i = j + 1; // skip past END
     } else {
       i++;
     }
   }
 
+  if (created.length) {
+    console.log(`✅ ${name}: wrote ${created.length} file(s)`);
+  } else {
+    console.log(`🟡 ${name}: no files found in bundle`);
+  }
   return created;
 }
 
 function main() {
-  // If there's no bundles dir yet, don't fail the workflow—just skip.
   if (!fs.existsSync(BUNDLES_DIR)) {
-    console.log("ℹ️  No /bundles folder yet — skipping assembly.");
-    process.exit(0);
+    console.log(`ℹ️  No bundles folder at ${BUNDLES_DIR}; nothing to assemble.`);
+    return;
   }
 
-  const files = fs.readdirSync(BUNDLES_DIR).filter((f) => f.endsWith(".txt"));
+  const files = fs
+    .readdirSync(BUNDLES_DIR)
+    .filter((f) => f.endsWith(".txt"))
+    .map((f) => path.join(BUNDLES_DIR, f));
 
   if (!files.length) {
-    console.log("ℹ️  No .txt bundles found in /bundles — skipping assembly.");
-    process.exit(0);
+    console.log("ℹ️  No .txt bundles found in /bundles; nothing to assemble.");
+    return;
   }
 
   let total = 0;
-
-  for (const f of files) {
-    const abs = path.join(BUNDLES_DIR, f);
-    const out = expandBundle(abs);
-    total += out.length;
-    const summary =
-      out.length > 0
-        ? `🧩 ${f}: wrote ${out.length} file(s)`
-        : `🧩 ${f}: no files found in bundle`;
-    console.log(summary);
-  }
+  for (const f of files) total += expandBundle(f).length;
 
   console.log(`✨ Done. Created/updated ${total} file(s).`);
 }
