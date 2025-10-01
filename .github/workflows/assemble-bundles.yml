@@ -1,10 +1,13 @@
+# .github/workflows/assemble-bundles.yml
 name: Assemble Bundles
+
 on:
   push:
     paths:
-      - "bundles/**.txt"
-      - ".github/workflows/assemble-bundles.yml"
-      - "scripts/expand-bundles.mjs"
+      - 'bundles/**/*.txt'
+      - 'scripts/expand-bundles.mjs'
+      - '.github/workflows/assemble-bundles.yml'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -17,10 +20,17 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
-      - name: Assemble
+          node-version: '20'
+
+      - name: Ensure bundles dir (ok if missing)
+        run: mkdir -p bundles
+
+      - name: Assemble (only if bundles exist)
+        if: ${{ hashFiles('bundles/**/*.txt') != '' }}
         run: node scripts/expand-bundles.mjs
+
       - name: Commit assembled files
+        if: ${{ hashFiles('bundles/**/*.txt') != '' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
