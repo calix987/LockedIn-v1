@@ -1,0 +1,27 @@
+import NavBar from "../components/NavBar";
+
+export default function Home() {
+  return (
+    <>
+      <NavBar />
+      <main className="container py-10">
+        <h1 className="text-3xl font-bold mb-2">Welcome to LockedIn</h1>
+        <p className="text-gray-600 mb-8">
+          This is the starter UI. We’ll layer in auth, posting, messaging, AI tools, and
+          everything else bit by bit using the bundle files.
+        </p>
+
+        <section className="grid sm:grid-cols-2 gap-6">
+          <div className="rounded-xl border p-5">
+            <h2 className="font-semibold mb-2">Your Feed</h2>
+            <p className="text-gray-600">A personalized stream of posts from your network.</p>
+          </div>
+          <div className="rounded-xl border p-5">
+            <h2 className="font-semibold mb-2">Jobs</h2>
+            <p className="text-gray-600">Search, filter, and track internships and roles.</p>
+          </div>
+        </section>
+      </main>
+    </>
+  );
+}
