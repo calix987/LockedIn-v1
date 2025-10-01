@@ -1,0 +1,178 @@
+===FILE: web/package.json===
+{
+  "name": "lockedin-web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p $PORT"
+  },
+  "dependencies": {
+    "next": "14.2.5",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "classnames": "2.5.1",
+    "lucide-react": "0.441.0"
+  },
+  "devDependencies": {
+    "autoprefixer": "10.4.19",
+    "postcss": "8.4.38",
+    "tailwindcss": "3.4.10"
+  }
+}
+===END===
+
+===FILE: web/next.config.js===
+/** @type {import('next').NextConfig} */
+const nextConfig = {};
+module.exports = nextConfig;
+===END===
+
+===FILE: web/postcss.config.js===
+module.exports = {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};
+===END===
+
+===FILE: web/tailwind.config.js===
+/** @type {import('tailwindcss').Config} */
+module.exports = {
+  content: [
+    "./pages/**/*.{js,jsx,ts,tsx}",
+    "./components/**/*.{js,jsx,ts,tsx}"
+  ],
+  theme: {
+    extend: {
+      colors: {
+        brand: {
+          50: "#eef2ff",
+          500: "#6366f1",
+          600: "#4f46e5",
+          700: "#4338ca"
+        }
+      }
+    },
+  },
+  plugins: [],
+};
+===END===
+
+===FILE: web/styles/globals.css===
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* basic page rhythm */
+body { @apply bg-white text-gray-900; }
+a { @apply text-brand-600 hover:text-brand-700; }
+.container { @apply max-w-6xl mx-auto px-4; }
+===END===
+
+===FILE: web/pages/_app.js===
+import "../styles/globals.css";
+
+export default function App({ Component, pageProps }) {
+  return <Component {...pageProps} />;
+}
+===END===
+
+===FILE: web/components/NavBar.jsx===
+import Link from "next/link";
+import { Briefcase, MessageSquareText, Home } from "lucide-react";
+
+export default function NavBar() {
+  return (
+    <header className="border-b bg-white/80 backdrop-blur">
+      <nav className="container flex items-center gap-6 py-3">
+        <Link href="/" className="font-semibold text-xl">
+          <span className="text-brand-700">Locked</span>In
+        </Link>
+        <div className="ml-auto flex items-center gap-4 text-sm">
+          <Link className="flex items-center gap-2 hover:underline" href="/"><Home size={18}/> Home</Link>
+          <Link className="flex items-center gap-2 hover:underline" href="/jobs"><Briefcase size={18}/> Jobs</Link>
+          <Link className="flex items-center gap-2 hover:underline" href="/messages"><MessageSquareText size={18}/> Messages</Link>
+        </div>
+      </nav>
+    </header>
+  );
+}
+===END===
+
+===FILE: web/pages/index.js===
+import NavBar from "../components/NavBar";
+
+export default function Home() {
+  return (
+    <>
+      <NavBar />
+      <main className="container py-10">
+        <h1 className="text-3xl font-bold mb-2">Welcome to LockedIn</h1>
+        <p className="text-gray-600 mb-8">
+          This is the starter UI. We’ll layer in auth, posting, messaging, AI tools, and
+          everything else bit by bit using the bundle files.
+        </p>
+
+        <section className="grid sm:grid-cols-2 gap-6">
+          <div className="rounded-xl border p-5">
+            <h2 className="font-semibold mb-2">Your Feed</h2>
+            <p className="text-gray-600">A personalized stream of posts from your network.</p>
+          </div>
+          <div className="rounded-xl border p-5">
+            <h2 className="font-semibold mb-2">Jobs</h2>
+            <p className="text-gray-600">Search, filter, and track internships and roles.</p>
+          </div>
+        </section>
+      </main>
+    </>
+  );
+}
+===END===
+
+===FILE: web/pages/jobs.js===
+import NavBar from "../components/NavBar";
+
+const MOCK_JOBS = [
+  { id: 1, title: "Software Intern", company: "Acme", location: "Remote" },
+  { id: 2, title: "Data Analyst Intern", company: "Nova", location: "NYC" },
+  { id: 3, title: "Product Intern", company: "Luma", location: "SF" }
+];
+
+export default function Jobs() {
+  return (
+    <>
+      <NavBar />
+      <main className="container py-10">
+        <h1 className="text-2xl font-bold mb-4">Jobs</h1>
+        <ul className="space-y-3">
+          {MOCK_JOBS.map(j => (
+            <li key={j.id} className="rounded-lg border p-4">
+              <div className="font-semibold">{j.title}</div>
+              <div className="text-gray-600">{j.company} • {j.location}</div>
+            </li>
+          ))}
+        </ul>
+      </main>
+    </>
+  );
+}
+===END===
+
+===FILE: web/pages/messages.js===
+import NavBar from "../components/NavBar";
+
+export default function Messages() {
+  return (
+    <>
+      <NavBar />
+      <main className="container py-10">
+        <h1 className="text-2xl font-bold mb-4">Messages</h1>
+        <p className="text-gray-600">Real-time chat will land in a later bundle.</p>
+      </main>
+    </>
+  );
+}
+===END===
