@@ -1,0 +1,33 @@
+name: Assemble Bundles
+on:
+  push:
+    paths:
+      - "bundles/**.txt"
+      - ".github/workflows/assemble-bundles.yml"
+      - "scripts/expand-bundles.mjs"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Assemble
+        run: node scripts/expand-bundles.mjs
+      - name: Commit assembled files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Assemble: expand bundles → repo files"
+            git push
+          fi
